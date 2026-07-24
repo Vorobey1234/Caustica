@@ -387,6 +387,12 @@ public final class RtComposite {
         hdrWrittenThisFrame = false;
     }
 
+    /** This frame's completion token, valid until {@link #finishGraphicsUse()} signals it. */
+    public RtGpuExecutor.GraphicsUse currentGraphicsUse() {
+        RenderSystem.assertOnRenderThread();
+        return pendingGraphicsUse;
+    }
+
     /** Signal this RT frame's shared completion token after its final TLAS consumer (world overlay). */
     public void finishGraphicsUse() {
         RtGpuExecutor.GraphicsUse graphicsUse = pendingGraphicsUse;
