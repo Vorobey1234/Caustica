@@ -163,9 +163,9 @@ public abstract class GameRendererMixin {
 		try {
 			RtWorldOverlay.INSTANCE.compositeIntoUiOverlay(this.mainRenderTarget);
 		} finally {
-			// The block-outline ray query consumes this frame's TLAS. Signal terrain retirement only after
-			// its transient command buffer has been placed later in the same graphics submission.
-			RtComposite.INSTANCE.finishTerrainGraphicsUse();
+			// The block-outline ray query consumes this frame's TLAS. Signal the shared RT frame token only
+			// after its transient command buffer has been placed later in the same graphics submission.
+			RtComposite.INSTANCE.finishGraphicsUse();
 		}
 	}
 

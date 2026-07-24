@@ -26,6 +26,8 @@ import org.lwjgl.vulkan.VkQueryPoolCreateInfo;
 
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUse;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 
 import java.util.List;
 
@@ -926,16 +928,14 @@ public final class RtAccel {
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
-        private final TlasRing.Slot ringSlot;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
-                             String label, TlasRing.Slot ringSlot) {
+                             String label) {
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
             this.label = label;
-            this.ringSlot = ringSlot;
         }
     }
 
@@ -956,7 +956,7 @@ public final class RtAccel {
             RtBuffer instanceBuffer;
             RtBuffer scratch;
             int capacity;
-            long lastGraphicsUse;
+            final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
             void destroy() {
                 accel.destroy();
@@ -983,13 +983,13 @@ public final class RtAccel {
      */
     /** Pack terrain and dynamic instances as two contiguous ranges without a composite-list get per item. */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
-                                           List<Instance> dynamicInstances, TlasRing ring, long graphicsUse) {
+                                           List<Instance> dynamicInstances, TlasRing ring, GraphicsUse graphicsUse) {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
         TlasRing.Slot slot = ring.slots[ring.cursor];
         // Complete the slot's prior graphics use before rewriting, rebuilding, or resizing it.
         if (slot != null) {
-            ctx.gpuExecutor().waitForGraphicsValue(slot.lastGraphicsUse);
+            ctx.gpuExecutor().graphicsUseWaiter().await(slot.graphicsUse);
         }
         if (slot == null || count > slot.capacity) {
             // Outgrown (or first use). The slot's previous use is confirmed off all queues by the wait
@@ -1007,16 +1007,9 @@ public final class RtAccel {
         if (count > 0) {
             slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
         }
-        slot.lastGraphicsUse = graphicsUse;
+        slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
-                "frame TLAS " + count + " instances", slot);
-    }
-
-    /** Extend a retained TLAS slot's lifetime when a frame traces it without rebuilding it this call. */
-    public static void markTlasUsed(PreparedTlas tlas, long graphicsUse) {
-        if (tlas.ringSlot != null) {
-            tlas.ringSlot.lastGraphicsUse = Math.max(tlas.ringSlot.lastGraphicsUse, graphicsUse);
-        }
+                "frame TLAS " + count + " instances");
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.

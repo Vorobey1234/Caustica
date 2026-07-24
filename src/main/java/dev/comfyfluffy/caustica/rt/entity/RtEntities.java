@@ -35,6 +35,10 @@ import org.lwjgl.system.MemoryUtil;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUse;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUseWaiter;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
@@ -301,7 +305,7 @@ public final class RtEntities {
         long meshHash;                           // hash of the captured mesh — rebuild only when it changes
         long lastSeen;                           // last frame this BE was in the scan window — for eviction
         float[] prevVerts;                       // block-local verts at this build, for the per-vertex MV diff
-        long lastGraphicsUse;
+        final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
     }
 
     /** One persistent updatable AS in an entity's ring: its own backing buffer + the topology it
@@ -320,7 +324,7 @@ public final class RtEntities {
         int indexCount;
         long updateScratchSize;
         int updatesSinceBuild;
-        long lastGraphicsUse;
+        final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
     }
 
     /** A per-entity ring of {@link EntitySlot}s, cycled one-per-frame so a refit never writes an AS still
@@ -356,7 +360,7 @@ public final class RtEntities {
 
     private static final class TableSlot {
         final RtBuffer buffer;
-        long lastGraphicsUse;
+        final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
         TableSlot(RtBuffer buffer) {
             this.buffer = buffer;
@@ -529,7 +533,7 @@ public final class RtEntities {
         final MotionArena motion = new MotionArena();
         final ArrayList<EntitySlot> usedEntitySlots = new ArrayList<>(entityListCapacity());
         final ArrayList<BeEntry> usedBlockEntities = new ArrayList<>();
-        long lastGraphicsUse;
+        final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
         void reset() {
             instances.clear();
@@ -582,11 +586,11 @@ public final class RtEntities {
         int count;        // geometry-table entries / TLAS instances
         int logicalCount; // ordinary entities + block entities + individual particles
 
-        long completedGraphicsUse;
+        final GraphicsUseWaiter graphicsUseWaiter;
 
-        FrameBuild(List<RtAccel.Instance> base, long completedGraphicsUse) {
+        FrameBuild(List<RtAccel.Instance> base, RtGpuExecutor gpuExecutor) {
             this.base = base;
-            this.completedGraphicsUse = completedGraphicsUse;
+            this.graphicsUseWaiter = gpuExecutor.graphicsUseWaiter();
         }
 
         boolean full() {
@@ -614,7 +618,7 @@ public final class RtEntities {
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         setCamera(camX, camY, camZ, projection, viewRotation);
 
-        FrameBuild build = new FrameBuild(base, ctx.gpuExecutor().completedGraphicsValue());
+        FrameBuild build = new FrameBuild(base, ctx.gpuExecutor());
         try {
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.capture")) {
                 captureEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
@@ -651,18 +655,18 @@ public final class RtEntities {
     }
 
     /** Associate every resource returned for a successfully enqueued frame with its graphics completion. */
-    public void markGraphicsUse(FrameEntities frame, long graphicsUse) {
-        if (frame == null || frame.use == null || graphicsUse == 0L) {
+    public void markGraphicsUse(FrameEntities frame, GraphicsUse graphicsUse) {
+        if (frame == null || frame.use == null) {
             return;
         }
         FrameLists lists = frame.use.lists;
-        lists.lastGraphicsUse = Math.max(lists.lastGraphicsUse, graphicsUse);
-        frame.use.table.lastGraphicsUse = Math.max(frame.use.table.lastGraphicsUse, graphicsUse);
+        lists.graphicsUse.mark(graphicsUse);
+        frame.use.table.graphicsUse.mark(graphicsUse);
         for (EntitySlot slot : lists.usedEntitySlots) {
-            slot.lastGraphicsUse = Math.max(slot.lastGraphicsUse, graphicsUse);
+            slot.graphicsUse.mark(graphicsUse);
         }
         for (BeEntry entry : lists.usedBlockEntities) {
-            entry.lastGraphicsUse = Math.max(entry.lastGraphicsUse, graphicsUse);
+            entry.graphicsUse.mark(graphicsUse);
         }
     }
 
@@ -1277,7 +1281,7 @@ public final class RtEntities {
         RtAccel accel = e.accel;
         RtBuffer backing = e.backing;
         RtBuffer geometry = e.geometry;
-        ctx.gpuExecutor().enqueueDestroyAfterGraphics(e.lastGraphicsUse, () -> {
+        ctx.gpuExecutor().retireAfterGraphics(e.graphicsUse, () -> {
             RtAccel.destroyEntityAccel(accel, backing);
             geometry.destroy();
         });
@@ -1324,7 +1328,7 @@ public final class RtEntities {
             return;
         }
         FrameLists lists = frameLists[(int) (RtComposite.frameCounter() % frameLists.length)];
-        awaitGraphicsUse(ctx, build, lists.lastGraphicsUse, "entityFrameListsWaits");
+        awaitGraphicsUse(build, lists.graphicsUse, "entityFrameListsWaits");
         lists.releaseDeferred();
         lists.reset();
         build.lists = lists;
@@ -1337,18 +1341,16 @@ public final class RtEntities {
         ensureResources(ctx);
         tableSlot = (tableSlot + 1) % TABLE_RING;
         build.table = tableRing[tableSlot];
-        awaitGraphicsUse(ctx, build, build.table.lastGraphicsUse, "entityTableWaits");
+        awaitGraphicsUse(build, build.table.graphicsUse, "entityTableWaits");
         build.tableBase = build.table.buffer.mapped;
         build.geomTableAddr = build.table.buffer.deviceAddress;
     }
 
-    private static void awaitGraphicsUse(RtContext ctx, FrameBuild build, long lastUse, String counter) {
-        if (lastUse <= build.completedGraphicsUse) {
+    private static void awaitGraphicsUse(FrameBuild build, TrackedGraphicsUse graphicsUse, String counter) {
+        long started = System.nanoTime();
+        if (!build.graphicsUseWaiter.await(graphicsUse)) {
             return;
         }
-        long started = System.nanoTime();
-        ctx.gpuExecutor().waitForGraphicsValue(lastUse);
-        build.completedGraphicsUse = lastUse;
         RtFrameStats.FRAME.count(counter, 1);
         RtFrameStats.FRAME.count("entityGraphicsWaitNanos", System.nanoTime() - started);
     }
@@ -1745,7 +1747,7 @@ public final class RtEntities {
             slot.owner = ea;
             ea.ring[s] = slot;
         } else {
-            awaitGraphicsUse(ctx, build, slot.lastGraphicsUse, "entitySlotWaits");
+            awaitGraphicsUse(build, slot.graphicsUse, "entitySlotWaits");
         }
         return slot;
     }
@@ -1905,7 +1907,7 @@ public final class RtEntities {
         slot.refitScratch = null;
         slot.indices = null;
         slot.indexCount = 0;
-        ctx.gpuExecutor().enqueueDestroyAfterGraphics(slot.lastGraphicsUse, () -> {
+        ctx.gpuExecutor().retireAfterGraphics(slot.graphicsUse, () -> {
             if (accel != null) RtAccel.destroyEntityAccel(accel, backing);
             if (geometry != null) geometry.destroy();
             if (scratch != null) scratch.destroy();
@@ -1937,7 +1939,7 @@ public final class RtEntities {
         }
         if (tableRing != null) {
             for (TableSlot old : tableRing) {
-                ctx.gpuExecutor().enqueueDestroyAfterGraphics(old.lastGraphicsUse, old.buffer::destroy);
+                ctx.gpuExecutor().retireAfterGraphics(old.graphicsUse, old.buffer::destroy);
                 RtFrameStats.FRAME.count("entityTableRetirements", 1);
             }
             tableRing = null;

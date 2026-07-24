@@ -287,7 +287,7 @@ public final class RtComposite {
     // makes the TLAS build's writes visible without an extra semaphore, matching every other overlay
     // feature's reliance on in-order queue execution for this frame's world content.
     private volatile long currentTlasHandle;
-    private long pendingTerrainGraphicsUse;
+    private RtGpuExecutor.GraphicsUse pendingGraphicsUse;
 
     private RtComposite() {
     }
@@ -380,27 +380,27 @@ public final class RtComposite {
      * runs instead.
      */
     public void beginFrame() {
-        if (pendingTerrainGraphicsUse != 0L) {
-            throw new IllegalStateException("Previous RT terrain graphics use was never completed");
+        if (pendingGraphicsUse != null) {
+            throw new IllegalStateException("Previous RT graphics use was never completed");
         }
         RtFrameStats.FRAME.beginIfInactive();
         hdrWrittenThisFrame = false;
     }
 
-    /** Record terrain retirement completion after the frame's final TLAS consumer (world overlay). */
-    public void finishTerrainGraphicsUse() {
-        long graphicsUse = pendingTerrainGraphicsUse;
-        if (graphicsUse == 0L) {
+    /** Signal this RT frame's shared completion token after its final TLAS consumer (world overlay). */
+    public void finishGraphicsUse() {
+        RtGpuExecutor.GraphicsUse graphicsUse = pendingGraphicsUse;
+        if (graphicsUse == null) {
             return;
         }
         RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
-            throw new IllegalStateException("RT context disappeared before terrain graphics use completed");
+            throw new IllegalStateException("RT context disappeared before graphics use completed");
         }
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice()
                 .createCommandEncoder()).caustica$getBackend();
-        ctx.gpuExecutor().endGraphicsTerrainUse(encoder, graphicsUse);
-        pendingTerrainGraphicsUse = 0L;
+        ctx.gpuExecutor().endGraphicsUse(encoder, graphicsUse);
+        pendingGraphicsUse = null;
     }
 
     public void endFrame() {
@@ -758,8 +758,8 @@ public final class RtComposite {
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
         // Reserve the graphics-use value that guards this frame's reusable TLAS and entity resources.
-        long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
-        pendingTerrainGraphicsUse = graphicsUse;
+        RtGpuExecutor.GraphicsUse graphicsUse = gpuExecutor.beginGraphicsUse(encoder);
+        pendingGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
@@ -891,7 +891,6 @@ public final class RtComposite {
                 frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
                         graphicsUse);
             }
-            RtAccel.markTlasUsed(frameTlas, graphicsUse);
             active.setTlas(frameTlas.accel.handle);
             currentTlasHandle = frameTlas.accel.handle;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
