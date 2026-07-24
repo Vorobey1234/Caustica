@@ -149,7 +149,7 @@ public final class RtComposite {
         return sunNoonY();
     }
 
-    // Monotonic per-composite frame counter, used by RtTerrain to time frames-in-flight-safe frees.
+    // Monotonic per-composite frame counter used for cache eviction, shader sampling, and diagnostics.
     private static volatile long frameCounter;
 
     public static long frameCounter() {
@@ -173,9 +173,9 @@ public final class RtComposite {
     private boolean materialEpochTraceGate;
     // World push data lives in a host-visible BDA ring; only the slot address and a small hot subset are
     // pushed inline (the full generated structure exceeds NVIDIA's 256-byte push-constant ceiling).
-    // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
+    // Exact graphics completion guards host writes; ring depth only avoids routine waits.
     private static final int PUSH_RING = 6;
-    private RtBuffer[] pushRing;
+    private PushSlot[] pushRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     private RtImage output;
@@ -200,6 +200,15 @@ public final class RtComposite {
     // Step C.2: composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
+
+    private static final class PushSlot {
+        final RtBuffer buffer;
+        final RtGpuExecutor.TrackedGraphicsUse graphicsUse = new RtGpuExecutor.TrackedGraphicsUse();
+
+        PushSlot(RtBuffer buffer) {
+            this.buffer = buffer;
+        }
+    }
     // Menu/non-RT present: converts the SDR main target (sRGB) to PQ-encoded at paper white so menus,
     // the title panorama and the loading screen present correctly to the PQ swapchain instead of being
     // raw-copied (misdisplayed). Lazily created; the image is sized to the swapchain.
@@ -515,10 +524,10 @@ public final class RtComposite {
                     WorldPushConstantsData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             if (pushRing == null) {
-                pushRing = new RtBuffer[PUSH_RING];
+                pushRing = new PushSlot[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
-                    pushRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
-                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
+                    pushRing[i] = new PushSlot(ctx.createBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i));
                 }
             }
             if (output != null) {
@@ -765,6 +774,7 @@ public final class RtComposite {
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
         // Reserve the graphics-use value that guards this frame's reusable TLAS and entity resources.
         RtGpuExecutor.GraphicsUse graphicsUse = gpuExecutor.beginGraphicsUse(encoder);
+        RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter = gpuExecutor.graphicsUseWaiter();
         pendingGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
@@ -787,7 +797,10 @@ public final class RtComposite {
             // Select the next BDA ring slot; the generated WorldPushData serializer fills it once all
             // frame-derived values (including entity addresses and block-breaking entries) are known.
             pushSlot = (pushSlot + 1) % PUSH_RING;
-            RtBuffer pushBuf = pushRing[pushSlot];
+            PushSlot selectedPushSlot = pushRing[pushSlot];
+            graphicsUseWaiter.await(selectedPushSlot.graphicsUse);
+            selectedPushSlot.graphicsUse.mark(graphicsUse);
+            RtBuffer pushBuf = selectedPushSlot.buffer;
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
             // flags: PBR BRDF (bit 1, always on) + camera-in-water (so the path tracer starts in the water
@@ -897,7 +910,7 @@ public final class RtComposite {
                 frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
                         graphicsUse);
             }
-            active.setTlas(frameTlas.accel.handle);
+            active.setTlas(frameTlas.accel.handle, graphicsUse, graphicsUseWaiter);
             currentTlasHandle = frameTlas.accel.handle;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
                 RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
@@ -1237,9 +1250,9 @@ public final class RtComposite {
         materialEpochTraceGate = false;
         RtMaterialRegistry.INSTANCE.destroy();
         if (pushRing != null) {
-            for (RtBuffer b : pushRing) {
-                if (b != null) {
-                    b.destroy();
+            for (PushSlot slot : pushRing) {
+                if (slot != null) {
+                    slot.buffer.destroy();
                 }
             }
             pushRing = null;

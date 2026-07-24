@@ -87,7 +87,7 @@ public final class RtWorldOverlay {
         try {
             List<RtOverlayFeature> ready = new ArrayList<>(features.size());
             for (RtOverlayFeature f : features) {
-                if (f.prepare(ctx, framePool, main.width, main.height)) {
+                if (f.prepare(ctx, framePool, graphicsUse, main.width, main.height)) {
                     ready.add(f);
                 }
             }
