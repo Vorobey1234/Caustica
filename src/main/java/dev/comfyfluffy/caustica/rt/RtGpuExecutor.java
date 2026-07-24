@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanQueue;
 import org.lwjgl.PointerBuffer;
@@ -100,11 +101,13 @@ public final class RtGpuExecutor {
 
     /** Mark a build visible to publication; the next graphics frame use waits on it. */
     public void markPublished(Build build) {
+        assertRenderThread();
         pendingPublishWaitValue.accumulateAndGet(build.value, Math::max);
     }
 
     /** Attach published-build waits and reserve the completion token shared by this frame's RT resources. */
     public GraphicsUse beginGraphicsUse(VulkanCommandEncoder encoder) {
+        assertRenderThread();
         checkExecutorFailure();
         long waitValue = pendingPublishWaitValue.get();
         if (waitValue != 0L) {
@@ -119,6 +122,7 @@ public final class RtGpuExecutor {
 
     /** Signal the frame token after its final terrain, TLAS, entity, and overlay consumer. */
     public void endGraphicsUse(VulkanCommandEncoder encoder, GraphicsUse graphicsUse) {
+        assertRenderThread();
         encoder.signalSemaphore(graphicsTimeline, graphicsUse.value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
         latestGraphicsUseValue.accumulateAndGet(graphicsUse.value, Math::max);
         if (hasPendingDestroys()) {
@@ -128,12 +132,14 @@ public final class RtGpuExecutor {
 
     /** Create a waiter that shares one completed-value snapshot across several resource reuse checks. */
     public GraphicsUseWaiter graphicsUseWaiter() {
+        assertRenderThread();
         checkExecutorFailure();
         return new GraphicsUseWaiter(queryTimeline(graphicsTimeline));
     }
 
     /** Latest recorded frame token that can reference currently published RT state. */
     public GraphicsUse latestGraphicsUse() {
+        assertRenderThread();
         return new GraphicsUse(latestGraphicsUseValue.get());
     }
 
@@ -149,6 +155,7 @@ public final class RtGpuExecutor {
 
     /** Destroy a tracked owner once its exact last frame use has completed. */
     public void retireAfterGraphics(TrackedGraphicsUse trackedUse, Runnable destroy) {
+        assertRenderThread();
         enqueueDestroyAfterGraphicsValue(trackedUse.value, destroy);
     }
 
@@ -354,6 +361,10 @@ public final class RtGpuExecutor {
         }
     }
 
+    private static void assertRenderThread() {
+        RenderSystem.assertOnRenderThread();
+    }
+
     private void processDestroyJobs() {
         if (!hasPendingDestroys()) {
             return;
@@ -516,6 +527,7 @@ public final class RtGpuExecutor {
         private long value;
 
         public void mark(GraphicsUse graphicsUse) {
+            assertRenderThread();
             value = Math.max(value, graphicsUse.value);
         }
     }
@@ -533,6 +545,7 @@ public final class RtGpuExecutor {
 
         /** Return true only when this call had to issue a host wait. */
         public boolean await(TrackedGraphicsUse trackedUse) {
+            assertRenderThread();
             long requiredValue = trackedUse.value;
             if (requiredValue <= completedValue) {
                 return false;
