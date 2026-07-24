@@ -2,7 +2,7 @@
 // current pipeline: visibility() uses a hit object purely as the traversal result and never invokes
 // the miss shader — it only fills the SBT slot.
 // Radiance and shadow rays share the exact Payload ABI, as Vulkan requires for every stage reachable by
-// a trace — see world.rgen.slang's shadowPayload.
+// a trace — see world.rgen.slang's visibility().
 import world_common;
 
 [shader("miss")]
