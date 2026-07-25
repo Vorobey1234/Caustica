@@ -64,12 +64,25 @@ public struct WorldPush {
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
 
-// 48-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
+// 32-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
 // uses three unsigned 10-bit coordinates; the geometric normal is reconstructed from the half axes.
+//
+// 32 divides the 64-byte cache line, so a record never straddles one. At the previous 48 bytes about
+// half of them did, costing two transactions apiece — and RIS fetches these at random indices, M per
+// shading vertex, so that is the layout's whole purpose. float3 forces 16-byte struct alignment and 32
+// is a multiple of it, so this lands with no tail padding.
+//
+// The rectangle area is derived rather than stored: the rect spans 2U x 2V, so area = 4*|U x V|, which
+// is exactly what the collector used to write (halfU = 0.5*(aHi-aLo)*e01 and rectArea =
+// |e01 x e03|*(aHi-aLo)*(bHi-bLo)). lightGeometricNormal already needs that cross product, so the
+// freed lane costs one length() the compiler shares with the normalize.
 public struct Light {
-    public float4 posArea;
-    public float4 halfULe;       // xyz world half-axis U, w bitcast R11G11B10 radiance
-    public float4 halfVSection;  // xyz half-axis V, w bitcast 10:10:10 section + normal-flip bit
+    public float3 pos;      // rebased world centre, f32 (the RIS target divides by distance to it)
+    public uint   le;       // bitcast R11G11B10 radiance
+    public uint   halfUxy;  // half2(U.x, U.y)
+    public uint   halfUzVx; // half2(U.z, V.x)
+    public uint   halfVyz;  // half2(V.y, V.z)
+    public uint   section;  // 10:10:10 grid-relative section coord + bit 30 normal-flip
 };
 
 // Eight-byte Vose alias-table column. PDFs are reconstructed from the selected Light.

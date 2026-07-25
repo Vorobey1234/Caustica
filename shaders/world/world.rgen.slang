@@ -527,26 +527,45 @@ float unpackUnsignedFloat(uint bits, uint mantissaBits) {
 }
 
 float3 lightRadiance(Light light) {
-    uint packed = asuint(light.halfULe.w);
+    uint packed = light.le;
     return float3(unpackUnsignedFloat(packed & 0x7ffu, 6u),
             unpackUnsignedFloat((packed >> 11u) & 0x7ffu, 6u),
             unpackUnsignedFloat((packed >> 22u) & 0x3ffu, 5u));
 }
 
 int3 lightSectionCoord(Light light) {
-    uint packed = asuint(light.halfVSection.w);
+    uint packed = light.section;
     return int3(int(packed & 0x3ffu), int((packed >> 10u) & 0x3ffu),
             int((packed >> 20u) & 0x3ffu));
 }
 
+// The half axes share three lanes two-at-a-time; see the Light record in world_common.
+float3 lightHalfU(Light light) {
+    return float3(unpackHalf2(light.halfUxy), unpackHalf2(light.halfUzVx).x);
+}
+
+float3 lightHalfV(Light light) {
+    return float3(unpackHalf2(light.halfUzVx).y, unpackHalf2(light.halfVyz));
+}
+
+// U x V drives both the emitter normal and the rectangle area, so it is computed once and shared.
+float3 lightCrossUV(Light light) {
+    return cross(lightHalfU(light), lightHalfV(light));
+}
+
+// The rect spans 2U x 2V, so its area is 4|U x V| — exactly the rectArea the collector used to store.
+float lightArea(Light light) {
+    return 4.0 * length(lightCrossUV(light));
+}
+
 float3 lightGeometricNormal(Light light) {
-    float3 normal = normalize(cross(light.halfULe.xyz, light.halfVSection.xyz));
-    return (asuint(light.halfVSection.w) & 0x40000000u) != 0u ? -normal : normal;
+    float3 normal = normalize(lightCrossUV(light));
+    return (light.section & 0x40000000u) != 0u ? -normal : normal;
 }
 
 float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
                   float localProbability) {
-    float power = max(0.0, light.posArea.w * luminance(le));
+    float power = max(0.0, lightArea(light) * luminance(le));
     float globalPdf = worldPush.lightAliasAddr != 0
             ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
     float localPdf = 0.0;
@@ -623,12 +642,13 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.posArea.xyz + worldPush.lightRebase.xyz
-                + s * lg.halfULe.xyz + t * lg.halfVSection.xyz;
+        float3 sp = lg.pos + worldPush.lightRebase.xyz
+                + s * lightHalfU(lg) + t * lightHalfV(lg);
         float3 le = lightRadiance(lg);
         float3 lightNormal = lightGeometricNormal(lg);
+        float area = lightArea(lg);
         float phat;
-        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
+        evalSampleContrib(sp, lightNormal, le, area, hitPos, n, v, rd,
                 diffAlb, F0, rough, pbr, twoSided, sss, phat);
         if (phat <= 0.0) {
             continue;
@@ -640,7 +660,7 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
             r.pos = sp;
             r.lnrm = lightNormal;
             r.le = le;
-            r.area = lg.posArea.w;
+            r.area = area;
             r.phat = phat;
         }
     }
