@@ -705,11 +705,11 @@ RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
 // information into a trace and is initialized to a neutral value here.
 Payload makeRadiancePayload(uint flags, uint rayCone) {
     Payload p;
-    p.albedo = float3(0.0, 0.0, 0.0);
-    p.normal = float3(0.0, 0.0, 0.0);
+    p.albedo = half3(0.0h, 0.0h, 0.0h);
+    p.normal = half3(0.0h, 0.0h, 0.0h);
     p.hitT = -1.0; // miss sentinel: world.rmiss writes only albedo, so a miss leaves this negative
-    p.motionPrev = float3(0.0, 0.0, 0.0);
-    p.f0 = float3(0.0, 0.0, 0.0);
+    p.motionPrev = half3(0.0h, 0.0h, 0.0h);
+    p.f0 = half3(0.0h, 0.0h, 0.0h);
     p.flags = flags;
     p.roughMetal = 0u;
     p.emissionSss = 0u;
@@ -744,11 +744,11 @@ void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, flo
 
 Payload makeShadowPayload() {
     Payload shadowPayload;
-    shadowPayload.albedo = float3(1.0, 1.0, 1.0);
+    shadowPayload.albedo = half3(1.0h, 1.0h, 1.0h);
     shadowPayload.hitT = -1.0; // water-crossing sentinel, filled by the water any-hit
-    shadowPayload.normal = float3(0.0, 0.0, 0.0);
-    shadowPayload.motionPrev = float3(0.0, 0.0, 0.0);
-    shadowPayload.f0 = float3(0.0, 0.0, 0.0);
+    shadowPayload.normal = half3(0.0h, 0.0h, 0.0h);
+    shadowPayload.motionPrev = half3(0.0h, 0.0h, 0.0h);
+    shadowPayload.f0 = half3(0.0h, 0.0h, 0.0h);
     shadowPayload.flags = 0u;
     shadowPayload.roughMetal = 0u;
     shadowPayload.emissionSss = 0u;

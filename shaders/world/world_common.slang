@@ -97,13 +97,23 @@ public struct LightGridSpan {
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
 public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
 
+// Largest finite half. The payload's half3 lanes carry HDR values (sky radiance most of all), so
+// producers clamp to this instead of letting the conversion round up to +inf.
+public static const float HALF_MAX = 65504.0;
+
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
+//
+// The three-component lanes are half3: they cost 6 bytes instead of 12, and payload storage is reserved
+// per trace call site, so every byte here is paid twice per radiance trace (once for TraceRay, once for
+// Invoke) and is preserved across the SER reorder. hitT stays f32 — it reaches 10000 blocks and the hit
+// position is reconstructed from it, where half's ~4-block spacing at that magnitude would be visible.
 public struct Payload {
-    public float3 albedo;      // hit: block albedo. miss: sky radiance.
-    public float3 normal;      // hit: geometric normal, viewer-oriented.
+    // Sky radiance on a miss, so this carries HDR values well above 1; half tops out at 65504.
+    public half3  albedo;      // hit: block albedo. miss: sky radiance.
+    public half3  normal;      // hit: geometric normal, viewer-oriented.
     public float  hitT;        // >= 0 on hit, < 0 on miss.
-    public float3 motionPrev;  // per-vertex world displacement since last frame.
-    public float3 f0;          // specular F0.
+    public half3  motionPrev;  // per-vertex world displacement since last frame.
+    public half3  f0;          // specular F0.
     public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
