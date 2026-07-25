@@ -803,9 +803,11 @@ public final class RtComposite {
             RtBuffer pushBuf = selectedPushSlot.buffer;
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
-            // flags: PBR BRDF (bit 1, always on) + camera-in-water (so the path tracer starts in the water
-            // medium when the eye is submerged, fixing the air→water first-segment orientation).
-            int flags = 0b10;
+            // flags: camera-in-water (so the path tracer starts in the water medium when the eye is
+            // submerged, fixing the air→water first-segment orientation) + W1 wave normals. Bit 1 used to
+            // gate a Lambertian fallback BRDF that nothing ever turned off; the GGX path is unconditional
+            // now, so that bit is unused rather than reassigned, to avoid a stale reader elsewhere.
+            int flags = 0;
             var level = Minecraft.getInstance().level;
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));

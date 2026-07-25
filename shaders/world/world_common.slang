@@ -38,7 +38,7 @@ public struct WorldPush {
     public uint     spp;
     public float2   jitter;
     public uint64_t entityTableAddr;  // entity geometry table
-    public uint     flags;            // bit0 submerged, bit1 PBR, bit4 waves
+    public uint     flags;            // bit0 submerged, bit4 waves (bit1 was PBR-toggle, now unconditional)
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)

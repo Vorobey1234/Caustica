@@ -435,7 +435,7 @@ Reservoir resEmpty() {
 //   - back hemisphere with sss>0 (LabPBR leaves/grass): HG transmission phase — cosT = dot(wi,rd) peaks
 //     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
 float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
-                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough, bool pbr,
+                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough,
                          bool twoSided, float sss, out float phat) {
     phat = 0.0;
     float3 toL = sp - hitPos;
@@ -457,7 +457,11 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 h
     if (ndl > 0.0) {
         float G = ndl * cosL / dist2; // area-light geometry term (x area)
         float3 brdf = diffAlb * INV_PI;
-        if (pbr) {
+        // twoSided callers are particle billboards, which pass rough=1/F0=0 and want diffuse-only
+        // shading: fresnelSchlick still returns up to full white at grazing angles even with F0=0 (that
+        // IS the Fresnel effect), so skipping the term here — not just zeroing F0 — is what keeps
+        // billboards from picking up a rim highlight they were never meant to have.
+        if (!twoSided) {
             float3 h = normalize(wi + v);
             float ndh = max(0.0, dot(n, h));
             float ndv = max(1.0e-4, dot(n, v));
@@ -652,7 +656,7 @@ static const uint RIS_MAX_DIFFUSE_DEPTH = 2u;
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool pbr, bool twoSided, float sss, uint shadedDepth,
+                     float rough, bool twoSided, float sss, uint shadedDepth,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
@@ -696,7 +700,7 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         float area = lightArea(lg);
         float phat;
         evalSampleContrib(sp, lightNormal, le, area, hitPos, n, v, rd,
-                diffAlb, F0, rough, pbr, twoSided, sss, phat);
+                diffAlb, F0, rough, twoSided, sss, phat);
         if (phat <= 0.0) {
             continue;
         }
@@ -720,14 +724,14 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
 // the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
 // sample's side of the surface.
 float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, bool pbr, bool twoSided, float sss, out float3 vis) {
+                      float3 F0, float rough, bool twoSided, float sss, out float3 vis) {
     vis = float3(0.0, 0.0, 0.0);
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
     float phat;
     float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, pbr, twoSided, sss, phat);
+            diffAlb, F0, rough, twoSided, sss, phat);
     if (phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -941,14 +945,11 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     uint material = payloadMaterial();
     motionPrev = material != MATERIAL_WATER ? payload.motionPrev : float3(0.0, 0.0, 0.0);
     if (material == MATERIAL_OPAQUE) {
-        bool pbr = (worldPush.flags & 2u) != 0u;
-        diffuseAlbedo = pbr ? payload.albedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0)) : payload.albedo;
-        if (pbr) {
-            float3 f0 = payload.f0;
-            float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
-            float NoV = clamp(dot(payload.normal, -refractedDir), 0.0, 1.0);
-            specAlbedo = rrSpecularAlbedo(f0, rough * rough, NoV);
-        }
+        diffuseAlbedo = payload.albedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0));
+        float3 f0 = payload.f0;
+        float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
+        float NoV = clamp(dot(payload.normal, -refractedDir), 0.0, 1.0);
+        specAlbedo = rrSpecularAlbedo(f0, rough * rough, NoV);
     }
 }
 
@@ -961,7 +962,6 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
     int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
-    bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
@@ -1112,11 +1112,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             // striking either side of the quad should still land (matches the sun/moon NEE above).
             if (risOn && diffuseDepth <= int(RIS_MAX_DIFFUSE_DEPTH)) {
                 float3 v = -rd;
-                Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0, false,
+                Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                         true, 0.0, uint(diffuseDepth), seed, proposalSeed);
                 float3 risVis;
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                        false, true, 0.0, risVis);
+                        true, 0.0, risVis);
             }
 
             if (bounce >= maxBounces) {
@@ -1200,18 +1200,17 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         float3 v = -rd; // view direction (toward the camera / incoming ray)
 
         // Material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a fixed
-        // 0.04 F0. With PBR disabled this collapses to the Lambertian fallback.
-        float rough = pbr ? clamp(payloadRoughness(), MIN_ROUGH, 1.0) : 1.0;
-        float metal = pbr ? clamp(payloadMetalness(), 0.0, 1.0) : 0.0;
+        // 0.04 F0, sourced from the chit (LabPBR custom/metal F0, or the dielectric default it applies).
+        float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
+        float metal = clamp(payloadMetalness(), 0.0, 1.0);
         float3 diffAlb = albedo * (1.0 - metal);
-        // F0 comes from the chit: dielectric 0.04, a LabPBR custom/metal F0, or albedo for metals.
-        float3 F0 = pbr ? payload.f0 : lerp(float3(0.04, 0.04, 0.04), albedo, metal);
+        float3 F0 = payload.f0;
 
         if (bounce == 0) { // primary-visibility surface: capture the denoiser guide buffers
             gv_normal = n;
-            gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
+            gv_albedo = diffAlb;  // RR diffuse-albedo demodulation target
             gv_rough = rough;
-            gv_specAlb = pbr ? rrSpecularAlbedo(F0, rough * rough, dot(n, v)) : float3(0.0, 0.0, 0.0);
+            gv_specAlb = rrSpecularAlbedo(F0, rough * rough, dot(n, v));
             gv_hitCamRel = ro + rd * payload.hitT - worldPush.camOffset; // camera-relative hit position
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
@@ -1259,16 +1258,14 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             }
             if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                 float3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
-                if (pbr) {
-                    float3 h = normalize(lightDir + v);
-                    float ndh = max(0.0, dot(n, h));
-                    float ndv = max(1.0e-4, dot(n, v));
-                    float vdh = max(0.0, dot(v, h));
-                    float D = ggxD(ndh, rough);
-                    float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
-                    float3 F = fresnelSchlick(vdh, F0);
-                    brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
-                }
+                float3 h = normalize(lightDir + v);
+                float ndh = max(0.0, dot(n, h));
+                float ndv = max(1.0e-4, dot(n, v));
+                float vdh = max(0.0, dot(v, h));
+                float D = ggxD(ndh, rough);
+                float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
+                float3 F = fresnelSchlick(vdh, F0);
+                brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
                 L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
             }
         }
@@ -1282,10 +1279,10 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // surface this path has shaded, and should still backlight.
         if (risActive) {
             float activeSss = diffuseDepth <= MAX_SSS_DIFFUSE_DEPTH ? sss : 0.0;
-            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
+            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
                     uint(diffuseDepth), seed, proposalSeed);
             float3 risVis;
-            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
+            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
                     activeSss, risVis);
         }
 
@@ -1318,36 +1315,28 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         diffuseDepth++;
 
         // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe, chosen by their
-        // relative reflectance. With PBR off, use the cosine-weighted Lambertian fallback.
-        if (pbr) {
-            float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
-            if (rndf(seed) < ps) {
-                float3 h = sampleGGXVNDF(n, v, rough, seed);
-                float3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
-                float ndl2 = dot(n, l);
-                if (ndl2 <= 0.0) {
-                    break; // microfacet reflects below the surface: terminate this path
-                }
-                // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
-                float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
-                throughput *= F * ggxG1(ndl2, rough) / ps;
-                ro = p;
-                rd = l;
-                rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
-                showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
-            } else {
-                throughput *= diffAlb / (1.0 - ps);
-                ro = p;
-                rd = cosineDir(n, seed);
-                rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
-                showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
+        // relative reflectance.
+        float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
+        if (rndf(seed) < ps) {
+            float3 h = sampleGGXVNDF(n, v, rough, seed);
+            float3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
+            float ndl2 = dot(n, l);
+            if (ndl2 <= 0.0) {
+                break; // microfacet reflects below the surface: terminate this path
             }
+            // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
+            float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
+            throughput *= F * ggxG1(ndl2, rough) / ps;
+            ro = p;
+            rd = l;
+            rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
+            showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
         } else {
-            throughput *= albedo; // Lambertian fallback (PI and cos cancel)
-            showCelestial = false; // diffuse bounce: hide the disc (covered by NEE)
+            throughput *= diffAlb / (1.0 - ps);
             ro = p;
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+            showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
         }
 
         // Russian roulette on deeper bounces: survive with prob = max channel, rescale survivors.
