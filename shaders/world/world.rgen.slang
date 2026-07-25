@@ -606,10 +606,46 @@ void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposal
     }
 }
 
+// Retained diagnostic — bounds what memory-side RIS work can be worth before any of it gets built. Every
+// non-zero setting produces a WRONG image on purpose: they exist to be timed, not looked at. Leave at 0.
+// Measured at M=8 (18.0ms baseline): 1 -> 12.1ms, 2 -> 16.7ms, 3 -> 16.9ms, 4 -> 13.7ms. So RIS's memory
+// side was 5.9ms of an 18ms frame, of which ~4.3ms sat at secondary vertices and ~1.1ms at the primary
+// hit, and coherence accounted for at most 1.3ms of it — depth, not divergence, was the cost.
+//   0 = off, normal behaviour.
+//   1 = pin every candidate to light 0. Keeps the RNG draws and all the shading ALU, but removes every
+//       dependent load (span -> alias -> record) and every bit of lane divergence, since all lanes now
+//       fetch one record. The delta is the ceiling for ANY memory-side RIS optimisation.
+//   2 = derive the proposal RNG from a 16x16 screen tile instead of the pixel, so lanes sharing a cell
+//       select the SAME lights. Chasing depth is unchanged; those record fetches become coherent. NOTE
+//       this is a LOWER bound on coherence: a shared seed does not force a shared cell, since
+//       findLightGridCell still keys off per-lane hitPos, so lanes in different cells keep diverging
+//       through cell.spanOffset.
+//   3 = pin at the PRIMARY vertex only (bounce 0).
+//   4 = pin at SECONDARY vertices only (bounce > 0).
+// 3 and 4 split 1's total by vertex, which is what decides the presample pool. The pool is keyed on the
+// world-space light grid cell, so it applies at every bounce — but its coverage depends on a frame-stale
+// registry containing the cells secondary vertices land in. If 4 is the larger share, that coverage is
+// the whole ballgame and needs verifying before the pool is worth building.
+static const uint RIS_PROBE = 0u;
+
+// Candidate-count divisor for RIS at secondary vertices (bounce > 0). Measured with the probes above,
+// secondary vertices carry ~4.3ms of RIS's 5.9ms memory cost — 78% — while being much the more forgiving
+// place to spend variance: that radiance is already integrated over a diffuse lobe before the denoiser
+// sees it. Reducing M there is therefore a different proposition from reducing it globally, which was
+// visibly worse at M=2. Sweep 1 (off) / 2 / 4; the primary hit always keeps worldPush.risCandidates.
+static const uint SECONDARY_RIS_DIVISOR = 1u;
+
+// Deepest bounce at which RIS emitter NEE runs at all. Past it, emitters are gathered only when a path
+// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep.
+// Secondary vertices already tolerate 4x fewer candidates; this asks whether deep bounces need RIS at
+// all. Unlike the divisor it also removes shadeReservoir's per-vertex shadow ray, which does not scale
+// with M and is now a large share of what remains. 64 = effectively off. Sweep 64 / 2 / 1 / 0.
+static const uint RIS_MAX_BOUNCE = 64u;
+
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool pbr, bool twoSided, float sss,
+                     float rough, bool pbr, bool twoSided, float sss, uint bounceIndex,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
@@ -622,7 +658,9 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
                 * worldPush.lightGridOrigin.w;
     }
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    uint candidateCount = worldPush.risCandidates;
+    uint candidateCount = bounceIndex == 0u
+            ? worldPush.risCandidates
+            : max(1u, worldPush.risCandidates / SECONDARY_RIS_DIVISOR);
     // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
     // local and two global candidates, with every lane taking the same branch for a given candidate.
     // Counts that are not divisible by four use the nearest practical split with at least one global
@@ -631,13 +669,24 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
             ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < worldPush.risCandidates; c++) {
+    for (uint c = 0u; c < candidateCount; c++) {
         r.M += 1.0;
         uint li;
         uint globalsBefore = (c * globalCandidateCount) / candidateCount;
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
+        bool pinCandidate = RIS_PROBE == 1u
+                || (RIS_PROBE == 3u && bounceIndex == 0u)
+                || (RIS_PROBE == 4u && bounceIndex != 0u);
+        if (pinCandidate) {
+            // Consume the draws the real selector would (two on the local path) so the ALU side stays
+            // roughly comparable, then skip the walk entirely.
+            rndf(proposalSeed);
+            rndf(proposalSeed);
+            li = 0u;
+        } else {
+            selectLightGridLight(gridCell, useLocal, proposalSeed, li);
+        }
         Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
@@ -920,7 +969,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
-    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
+    // RIS_PROBE == 2 keys this to a 16x16 tile instead of the pixel, making a whole tile select the same
+    // lights so the record fetches go coherent. Diagnostic only — this is exactly the sharing that
+    // produced visible tile-shaped noise before, which is why a real pool shares the POOL, not the seed.
+    uint2 proposalPix = RIS_PROBE == 2u ? (pix >> 4u) : pix;
+    uint proposalSeed = proposalPix.x * 1973u + proposalPix.y * 9277u + 26699u
             ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
     proposalSeed = pcg(proposalSeed);
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
@@ -1059,7 +1112,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             if (risOn) {
                 float3 v = -rd;
                 Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0, false,
-                        true, 0.0, seed, proposalSeed);
+                        true, 0.0, uint(bounce), seed, proposalSeed);
                 float3 risVis;
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                         false, true, 0.0, risVis);
@@ -1173,7 +1226,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // Emission is already the full HDR strength (EMISSIVE_STRENGTH baseline * any override
         // multiplier baked in Java at material-compile time — see MaterialHeader.features packing).
         float emission = payloadEmission();
-        bool gateEmitter = risOn && payloadEmitterInList();
+        // One gate drives both the RIS call below and the direct-hit emission suppression here. They must
+        // agree: gateEmitter exists only because RIS already accounted for this emitter, so a bounce where
+        // RIS is skipped must also gather emission directly or that light is lost outright.
+        bool risActive = risOn && bounce <= int(RIS_MAX_BOUNCE);
+        bool gateEmitter = risActive && payloadEmitterInList();
         if (emission > 0.0 && (!gateEmitter || showCelestial)) {
             L += throughput * albedo * emission;
         }
@@ -1219,10 +1276,10 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // only be in front of n or behind it, never both, so combining them into one target function is
         // exact, not an approximation. The SSS term is gated off past MAX_SSS_BOUNCE by passing sss=0
         // there (falls back to plain front-only RIS).
-        if (risOn) {
+        if (risActive) {
             float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
-                    seed, proposalSeed);
+                    uint(bounce), seed, proposalSeed);
             float3 risVis;
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
                     activeSss, risVis);
