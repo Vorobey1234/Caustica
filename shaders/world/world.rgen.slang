@@ -78,10 +78,6 @@ float payloadEmission() { return unpackHalf2(payload.emissionSss).x; }
 float payloadSss() { return unpackHalf2(payload.emissionSss).y; }
 float payloadIor() { return unpackHalf2(payload.iorTransmission).x; }
 float payloadTransmission() { return unpackHalf2(payload.iorTransmission).y; }
-void payloadSetTraceState(bool showCelestial, float rayConeWidth, float rayConeSpread) {
-    payload.flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
-    payload.rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
-}
 
 static const float PI = 3.14159265359;
 static const float INV_PI = 0.31830988618;
@@ -703,13 +699,46 @@ RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
     return r;
 }
 
+// A radiance payload carrying only the two words the invoked hit/miss shader READS: `flags`
+// (show-celestial gate, consumed by world.rmiss) and the packed ray cone (consumed by world.rchit for
+// texture LOD). Every other member is an OUTPUT that world.rchit/world.rmiss write, so it carries no
+// information into a trace and is initialized to a neutral value here.
+Payload makeRadiancePayload(uint flags, uint rayCone) {
+    Payload p;
+    p.albedo = float3(0.0, 0.0, 0.0);
+    p.normal = float3(0.0, 0.0, 0.0);
+    p.hitT = -1.0; // miss sentinel: world.rmiss writes only albedo, so a miss leaves this negative
+    p.motionPrev = float3(0.0, 0.0, 0.0);
+    p.f0 = float3(0.0, 0.0, 0.0);
+    p.flags = flags;
+    p.roughMetal = 0u;
+    p.emissionSss = 0u;
+    p.iorTransmission = 0u;
+    p.rayCone = rayCone;
+    return p;
+}
+
 // SER radiance trace: trace into a hit object, reorder threads by hit coherence, THEN invoke the
 // hit/miss shader — this is where the divergent Section/Prim shading work (world.rchit/world.rahit)
 // actually happens, so reordering before it is what pays for the reorder's own cost.
-void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) {
+//
+// The payload is built TWICE from the trace state rather than carried across ReorderThread. Traversal
+// runs only world.rahit, which never writes a RADIANCE payload: its terrain tint paths live in the
+// translucent/water buckets, which carry no any-hit record for radiance rays, and its entity paths are
+// gated on RAY_FLAG_SKIP_CLOSEST_HIT_SHADER. So whatever TraceRay leaves in the payload holds no
+// information. Reading it back and carrying it over would pin all ten members — 72 bytes — in registers
+// across the one point where SER must spill every live value, which profiling showed to be the peak
+// live state in this shader. Rebuilding costs a few constant moves and leaves only these two words
+// spanning the reorder.
+void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
+                            bool showCelestial, float rayConeWidth, float rayConeSpread) {
+    uint flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
+    uint rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
+    Payload tracePayload = makeRadiancePayload(flags, rayCone);
     HitObject hObj = HitObject::TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
-            SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), payload);
+            SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), tracePayload);
     ReorderThread(hObj);
+    payload = makeRadiancePayload(flags, rayCone);
     HitObject::Invoke(topLevelAS, hObj, payload);
 }
 
@@ -783,11 +812,10 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
     // lies in the screen plane there) -> a non-zero MV in a static scene. Reconstructing from surfacePos
     // cancels the term so the mirror lands exactly on the view ray (static MV = bit-exact zero) WITHOUT
     // zeroing the trace bias the main path tracer needs to avoid surface acne.
-    payload.hitT = -1.0;
-    payloadSetTraceState(false,
+    traceRadianceReordered(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0,
+            false,
             max(length(surfacePos - worldPush.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
-    traceRadianceReordered(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0);
 
     float3 reflectedHit;
     float3 reflectedMotionPrev;
@@ -831,9 +859,8 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     refracted = true;
 
     float3 ro = surfacePos - surfaceNormal * SURF_BIAS;
-    payload.hitT = -1.0;
-    payloadSetTraceState(false, rayConeWidth, rayConeSpread);
-    traceRadianceReordered(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0);
+    traceRadianceReordered(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0,
+            false, rayConeWidth, rayConeSpread);
     if (payload.hitT < 0.0) {
         hitCamRel = (ro + refractedDir * 1.0e6) - worldPush.camOffset; // sky through the surface, at infinity
         motionPrev = float3(0.0, 0.0, 0.0);
@@ -889,13 +916,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     // would be a double-counted firefly. Reset true on every specular/water bounce, false on a diffuse one.
     bool showCelestial = true;
     for (int bounce = 0; bounce <= maxBounces; bounce++) {
-        payload.hitT = -1.0;
-        payloadSetTraceState(showCelestial, rayConeWidth, rayConeSpread);
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
-        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0);
+        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
+                showCelestial, rayConeWidth, rayConeSpread);
 
         if (payload.hitT < 0.0) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into payload.albedo. The
