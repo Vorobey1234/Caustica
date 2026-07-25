@@ -627,24 +627,28 @@ void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposal
 // gone entirely.
 static const uint SECONDARY_RIS_DIVISOR = 4u;
 
-// Deepest bounce at which RIS emitter NEE runs at all. Past it, emitters are gathered only when a path
-// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep, so
-// the failure mode is noisier emitter light at depth rather than missing light. Unlike the divisor this
-// also drops shadeReservoir's per-vertex shadow ray, which never scaled with M. 16.1 -> 15.7ms.
+// Deepest SHADED surface at which RIS emitter NEE runs. Past it, emitters are gathered only when a path
+// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep, so the
+// failure mode is noisier emitter light at depth rather than missing light. Unlike the divisor this also
+// drops shadeReservoir's per-vertex shadow ray, which never scaled with M. Gating at all: 16.1 -> 15.7ms.
 //
-// 2, not lower, and the reason is worth keeping: `bounce` is NOT indirect depth. The MATERIAL_GLASS and
-// MATERIAL_WATER branches continue without being diffuse vertices, so looking through a pane spends
-// bounce 0 on the glass and lands the first DIFFUSE vertex at bounce 1. Gating below 2 therefore starves
-// surfaces seen through glass or water — visually primary, but counted as depth — and they go black,
-// since only a path randomly striking an emitter can light them. The two bounces of headroom pay for
-// that dielectric prefix. Counting diffuse vertices instead of bounces would let this go lower and be
-// more correct at once; it is the obvious next cleanup here.
-static const uint RIS_MAX_BOUNCE = 2u;
+// This counts diffuseDepth, not `bounce`, and the difference is not cosmetic. MATERIAL_GLASS and
+// MATERIAL_WATER continue without shading anything, so looking through a pane spends bounce 0 on the
+// glass and lands the first shaded surface at bounce 1. Gating on `bounce` therefore starved surfaces
+// seen through glass or water — visually primary, but counted as depth — and they went black, since only
+// a path randomly striking an emitter could light them. Keying on shaded surfaces removes that whole
+// class of bug and lets the budget go lower than the two bounces of headroom the dielectric prefix used
+// to cost.
+//
+// Caveat this does not solve: a smooth specular bounce IS a shaded surface, so a wall seen in a metal
+// block counts as depth 1. Accumulated roughness rather than a vertex count is the principled fix, and
+// is what a radiance cache would need anyway to decide cache-vs-trace.
+static const uint RIS_MAX_DIFFUSE_DEPTH = 2u;
 
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool pbr, bool twoSided, float sss, uint bounceIndex,
+                     float rough, bool pbr, bool twoSided, float sss, uint shadedDepth,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
@@ -657,7 +661,9 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
                 * worldPush.lightGridOrigin.w;
     }
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    uint candidateCount = bounceIndex == 0u
+    // shadedDepth, not the bounce index: a surface behind glass or water is the first thing this path has
+    // shaded and is visually primary, so it keeps the full candidate count.
+    uint candidateCount = shadedDepth == 0u
             ? worldPush.risCandidates
             : max(1u, worldPush.risCandidates / SECONDARY_RIS_DIVISOR);
     // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
@@ -974,6 +980,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     // diffuse-sampled continuation rays — those are already covered by the sun NEE, so the tiny disc
     // would be a double-counted firefly. Reset true on every specular/water bounce, false on a diffuse one.
     bool showCelestial = true;
+    // Number of surfaces this path has SHADED so far, as distinct from `bounce`, which also counts
+    // dielectric interfaces. Glass and water continue without shading anything, so a wall behind a pane
+    // is bounce 1 but diffuseDepth 0 — visually primary, and it must be treated as such. See
+    // RIS_MAX_DIFFUSE_DEPTH.
+    int diffuseDepth = 0;
     for (int bounce = 0; bounce <= maxBounces; bounce++) {
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
@@ -1095,10 +1106,10 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             // RIS direct lighting from block emitters (lava, glowstone, torches, ...) — same reservoir
             // sampler as terrain/entities, but two-sided: a billboard has no back face, so light
             // striking either side of the quad should still land (matches the sun/moon NEE above).
-            if (risOn) {
+            if (risOn && diffuseDepth <= int(RIS_MAX_DIFFUSE_DEPTH)) {
                 float3 v = -rd;
                 Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0, false,
-                        true, 0.0, uint(bounce), seed, proposalSeed);
+                        true, 0.0, uint(diffuseDepth), seed, proposalSeed);
                 float3 risVis;
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                         false, true, 0.0, risVis);
@@ -1112,6 +1123,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
+            diffuseDepth++;        // a billboard is a shaded surface, unlike the dielectric branches
             continue;
         }
 
@@ -1215,7 +1227,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // One gate drives both the RIS call below and the direct-hit emission suppression here. They must
         // agree: gateEmitter exists only because RIS already accounted for this emitter, so a bounce where
         // RIS is skipped must also gather emission directly or that light is lost outright.
-        bool risActive = risOn && bounce <= int(RIS_MAX_BOUNCE);
+        bool risActive = risOn && diffuseDepth <= int(RIS_MAX_DIFFUSE_DEPTH);
         bool gateEmitter = risActive && payloadEmitterInList();
         if (emission > 0.0 && (!gateEmitter || showCelestial)) {
             L += throughput * albedo * emission;
@@ -1265,7 +1277,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         if (risActive) {
             float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
-                    uint(bounce), seed, proposalSeed);
+                    uint(diffuseDepth), seed, proposalSeed);
             float3 risVis;
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
                     activeSss, risVis);
@@ -1293,6 +1305,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 }
             }
         }
+
+        // Every shading term for this surface is now accounted for, so it counts toward the shaded depth.
+        // The dielectric branches above return before reaching here, which is exactly the distinction
+        // between this and `bounce`.
+        diffuseDepth++;
 
         // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe, chosen by their
         // relative reflectance. With PBR off, use the cosine-weighted Lambertian fallback.
