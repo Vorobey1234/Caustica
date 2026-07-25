@@ -606,41 +606,40 @@ void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposal
     }
 }
 
-// Retained diagnostic — bounds what memory-side RIS work can be worth before any of it gets built. Every
-// non-zero setting produces a WRONG image on purpose: they exist to be timed, not looked at. Leave at 0.
-// Measured at M=8 (18.0ms baseline): 1 -> 12.1ms, 2 -> 16.7ms, 3 -> 16.9ms, 4 -> 13.7ms. So RIS's memory
-// side was 5.9ms of an 18ms frame, of which ~4.3ms sat at secondary vertices and ~1.1ms at the primary
-// hit, and coherence accounted for at most 1.3ms of it — depth, not divergence, was the cost.
-//   0 = off, normal behaviour.
-//   1 = pin every candidate to light 0. Keeps the RNG draws and all the shading ALU, but removes every
-//       dependent load (span -> alias -> record) and every bit of lane divergence, since all lanes now
-//       fetch one record. The delta is the ceiling for ANY memory-side RIS optimisation.
-//   2 = derive the proposal RNG from a 16x16 screen tile instead of the pixel, so lanes sharing a cell
-//       select the SAME lights. Chasing depth is unchanged; those record fetches become coherent. NOTE
-//       this is a LOWER bound on coherence: a shared seed does not force a shared cell, since
-//       findLightGridCell still keys off per-lane hitPos, so lanes in different cells keep diverging
-//       through cell.spanOffset.
-//   3 = pin at the PRIMARY vertex only (bounce 0).
-//   4 = pin at SECONDARY vertices only (bounce > 0).
-// 3 and 4 split 1's total by vertex, which is what decides the presample pool. The pool is keyed on the
-// world-space light grid cell, so it applies at every bounce — but its coverage depends on a frame-stale
-// registry containing the cells secondary vertices land in. If 4 is the larger share, that coverage is
-// the whole ballgame and needs verifying before the pool is worth building.
-static const uint RIS_PROBE = 0u;
+// ---- RIS cost budget. Both constants below come from a set of temporary probes that pinned the
+// candidate walk out of the shader to bound what memory-side RIS work could ever be worth. Against an
+// 18.0ms frame at M=8, removing every dependent load (span -> alias -> record) and all lane divergence
+// saved 5.9ms — a third of the frame. Split by vertex that was ~4.3ms at secondary vertices against
+// ~1.1ms at the primary hit, and forcing coherent selection recovered at most 1.3ms of it. So the cost
+// was chasing DEPTH, not divergence, and it lived at secondary vertices. The two knobs below spend that
+// finding; a presampled candidate pool would attack the same 5.9ms structurally, but see the note on
+// proposalSeed in tracePath for why it should share the pool rather than the seed.
 
-// Candidate-count divisor for RIS at secondary vertices (bounce > 0). Measured with the probes above,
-// secondary vertices carry ~4.3ms of RIS's 5.9ms memory cost — 78% — while being much the more forgiving
-// place to spend variance: that radiance is already integrated over a diffuse lobe before the denoiser
-// sees it. Reducing M there is therefore a different proposition from reducing it globally, which was
-// visibly worse at M=2. Sweep 1 (off) / 2 / 4; the primary hit always keeps worldPush.risCandidates.
-static const uint SECONDARY_RIS_DIVISOR = 1u;
+// Candidate-count divisor for RIS at secondary vertices (bounce > 0). Secondary vertices carried ~78% of
+// the cost while being much the more forgiving place to spend variance: that radiance is already
+// integrated over a diffuse lobe before the denoiser sees it. 18.0 -> 16.1ms, and indistinguishable from
+// 1 by eye — whereas reducing M globally to 2 was clearly worse, because that also degraded the primary
+// hit. The primary hit always keeps the full worldPush.risCandidates.
+//
+// 4 is the floor worth using rather than a tuning accident. The stratification below keeps at least one
+// global candidate, so M=2 is the smallest count that still schedules one local AND one global; at M=1
+// localProbability collapses to 0 and the light-grid proposal that makes nearby emitters sample well is
+// gone entirely.
+static const uint SECONDARY_RIS_DIVISOR = 4u;
 
 // Deepest bounce at which RIS emitter NEE runs at all. Past it, emitters are gathered only when a path
-// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep.
-// Secondary vertices already tolerate 4x fewer candidates; this asks whether deep bounces need RIS at
-// all. Unlike the divisor it also removes shadeReservoir's per-vertex shadow ray, which does not scale
-// with M and is now a large share of what remains. 64 = effectively off. Sweep 64 / 2 / 1 / 0.
-static const uint RIS_MAX_BOUNCE = 64u;
+// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep, so
+// the failure mode is noisier emitter light at depth rather than missing light. Unlike the divisor this
+// also drops shadeReservoir's per-vertex shadow ray, which never scaled with M. 16.1 -> 15.7ms.
+//
+// 2, not lower, and the reason is worth keeping: `bounce` is NOT indirect depth. The MATERIAL_GLASS and
+// MATERIAL_WATER branches continue without being diffuse vertices, so looking through a pane spends
+// bounce 0 on the glass and lands the first DIFFUSE vertex at bounce 1. Gating below 2 therefore starves
+// surfaces seen through glass or water — visually primary, but counted as depth — and they go black,
+// since only a path randomly striking an emitter can light them. The two bounces of headroom pay for
+// that dielectric prefix. Counting diffuse vertices instead of bounces would let this go lower and be
+// more correct at once; it is the obvious next cleanup here.
+static const uint RIS_MAX_BOUNCE = 2u;
 
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
@@ -675,18 +674,7 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         uint globalsBefore = (c * globalCandidateCount) / candidateCount;
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        bool pinCandidate = RIS_PROBE == 1u
-                || (RIS_PROBE == 3u && bounceIndex == 0u)
-                || (RIS_PROBE == 4u && bounceIndex != 0u);
-        if (pinCandidate) {
-            // Consume the draws the real selector would (two on the local path) so the ALU side stays
-            // roughly comparable, then skip the walk entirely.
-            rndf(proposalSeed);
-            rndf(proposalSeed);
-            li = 0u;
-        } else {
-            selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        }
+        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
         Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
@@ -969,11 +957,9 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
-    // RIS_PROBE == 2 keys this to a 16x16 tile instead of the pixel, making a whole tile select the same
-    // lights so the record fetches go coherent. Diagnostic only — this is exactly the sharing that
-    // produced visible tile-shaped noise before, which is why a real pool shares the POOL, not the seed.
-    uint2 proposalPix = RIS_PROBE == 2u ? (pix >> 4u) : pix;
-    uint proposalSeed = proposalPix.x * 1973u + proposalPix.y * 9277u + 26699u
+    // Measured: making a 16x16 tile share this seed recovers at most 1.3ms, so a future pool should share
+    // the POOL rather than the seed — the win is in removing dependent loads, not in coherence.
+    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
             ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
     proposalSeed = pcg(proposalSeed);
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
