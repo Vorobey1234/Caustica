@@ -247,7 +247,11 @@ float3 fresnelSchlick(float cosT, float3 f0) {
 // g=0 → isotropic; g>0 → forward-scatter peak at cosT=1 (light and view aligned through a thin slab).
 static const float SSS_G        = 0.6; // forward-scatter anisotropy; leaves/grass are quite directional
 static const float SSS_STRENGTH = 1.0; // 1.0 ≈ 2.5× the Lambertian at peak (sss=1, cosT=1, backNdl=1)
-static const int   MAX_SSS_BOUNCE = 1; // fire the transmission shadow ray on primary + first indirect hit only
+// Deepest SHADED surface at which the SSS transmission shadow ray fires. diffuseDepth, not `bounce`: the
+// glass/water continue branches don't shade a surface, so foliage seen through a window is still
+// diffuseDepth 0 and should backlight like any other primary leaf — see RIS_MAX_DIFFUSE_DEPTH for the
+// same distinction and why it matters.
+static const int   MAX_SSS_DIFFUSE_DEPTH = 1; // fire on the first-shaded surface + one indirect hit
 float hg(float cosT, float g) {
     float g2 = g * g;
     return (1.0 - g2) / (4.0 * PI * pow(max(0.0, 1.0 + g2 - 2.0 * g * cosT), 1.5));
@@ -1272,10 +1276,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
         // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
         // only be in front of n or behind it, never both, so combining them into one target function is
-        // exact, not an approximation. The SSS term is gated off past MAX_SSS_BOUNCE by passing sss=0
-        // there (falls back to plain front-only RIS).
+        // exact, not an approximation. The SSS term is gated off past MAX_SSS_DIFFUSE_DEPTH by passing
+        // sss=0 there (falls back to plain front-only RIS). Keyed on diffuseDepth, not `bounce`, for the
+        // same reason as RIS_MAX_DIFFUSE_DEPTH above: leaves seen through a window are still the first
+        // surface this path has shaded, and should still backlight.
         if (risActive) {
-            float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
+            float activeSss = diffuseDepth <= MAX_SSS_DIFFUSE_DEPTH ? sss : 0.0;
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
                     uint(diffuseDepth), seed, proposalSeed);
             float3 risVis;
@@ -1288,7 +1294,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // through them toward the light source). Shadow ray fires from the back face to avoid
         // self-occlusion. cosT = dot(lightDir, rd): rd tracks the ray toward the sun when the sun is
         // behind the slab, giving cosT ≈ 1 → forward-scatter peak.
-        if (sss > 0.0 && bounce <= MAX_SSS_BOUNCE) {
+        if (sss > 0.0 && diffuseDepth <= MAX_SSS_DIFFUSE_DEPTH) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
                 VisibilityResult shadowBack = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
