@@ -486,8 +486,8 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 h
 void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
     float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
     uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
-    if (worldPush.lightAliasAddr != 0) {
-        LightAlias a = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[column];
+    if (pc.lightAliasAddr != 0) {
+        LightAlias a = ConstPtr<LightAlias>(pc.lightAliasAddr)[column];
         bool self = aliasSample - float(column) < a.accept;
         lightIndex = self ? column : a.aliasIndex;
     } else {
@@ -500,7 +500,7 @@ bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
     cell.spanCount = 0u;
     cell.invWeightSum = 0.0;
     cellCoord = int3(0, 0, 0);
-    if (worldPush.lightGridCellAddr == 0 || worldPush.lightGridSpanAddr == 0) return false;
+    if (pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0) return false;
     int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
     if (coord.x < 0 || coord.y < 0 || coord.z < 0
             || coord.x >= worldPush.lightGridDims.x
@@ -508,7 +508,7 @@ bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
             || coord.z >= worldPush.lightGridDims.z) return false;
     uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
             * uint(worldPush.lightGridDims.x) + uint(coord.x);
-    cell = ConstPtr<LightGridCell>(worldPush.lightGridCellAddr)[linear];
+    cell = ConstPtr<LightGridCell>(pc.lightGridCellAddr)[linear];
     cellCoord = coord;
     return cell.spanCount > 0u;
 }
@@ -517,7 +517,7 @@ void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSee
                         out uint lightIndex) {
     float aliasSample = rndf(proposalSeed) * float(lightCount);
     uint column = min(uint(aliasSample), lightCount - 1u);
-    LightAlias alias = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)[firstLight + column];
+    LightAlias alias = ConstPtr<LightAlias>(pc.lightLocalAliasAddr)[firstLight + column];
     bool self = aliasSample - float(column) < alias.accept;
     uint localIndex = self ? column : alias.aliasIndex;
     lightIndex = firstLight + localIndex;
@@ -574,7 +574,7 @@ float3 lightGeometricNormal(Light light) {
 float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
                   float localProbability) {
     float power = max(0.0, lightArea(light) * luminance(le));
-    float globalPdf = worldPush.lightAliasAddr != 0
+    float globalPdf = pc.lightAliasAddr != 0
             ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
     float localPdf = 0.0;
     if (localProbability > 0.0 && power > 0.0) {
@@ -589,7 +589,7 @@ float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
 
 void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
                               out uint lightIndex) {
-    ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(worldPush.lightGridSpanAddr);
+    ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(pc.lightGridSpanAddr);
     float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
     uint column = min(uint(aliasSample), cell.spanCount - 1u);
     LightGridSpan span = spans[cell.spanOffset + column];
@@ -662,7 +662,7 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
-    if (worldPush.lightGridCellAddr != 0) {
+    if (pc.lightGridCellAddr != 0) {
         // Stochastically blend across hard section boundaries. Every cell proposal retains full global
         // support, so conditioning on this independently jittered lookup remains unbiased.
         gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
@@ -689,7 +689,7 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
         selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
+        Light lg = ConstPtr<Light>(pc.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
@@ -964,7 +964,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     int rrStart = maxBounces <= 3 ? 1 : 2;
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
-    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
+    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && pc.lightBufAddr != 0;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
     // Measured: making a 16x16 tile share this seed recovers at most 1.3ms, so a future pool should share

@@ -10,12 +10,21 @@ module world_common;
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
 
 // Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
-// hit shaders or used for raygen control flow.
+// hit shaders or used for raygen control flow — every 64-bit device address lives here for exactly that
+// reason, rather than behind the worldPushAddr indirection. tableAddr/entityTableAddr/materialTableAddr
+// are read in world.rahit/world.rchit, which never load WorldPush at all; the light-buffer addresses are
+// only read in world.rgen, which loads WorldPush anyway, but keeping every Addr in one place means there
+// is exactly one struct to check when adding a new device buffer, instead of two.
 public struct WorldPushConstants {
     public uint64_t worldPushAddr;
     public uint64_t tableAddr;
     public uint64_t entityTableAddr;
     public uint64_t materialTableAddr;
+    public uint64_t lightBufAddr;        // RIS emitter-NEE global light buffer (0 = none published)
+    public uint64_t lightAliasAddr;      // power-weighted O(1) alias table (0 = uniform fallback)
+    public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
+    public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
+    public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
     public uint frameIndex;
     public uint debugView;
 };
@@ -31,13 +40,11 @@ public struct BreakEntry {
 public struct WorldPush {
     public float4x4 invViewProj;
     public float3   camOffset;
-    public uint64_t tableAddr;        // section table
     public uint     frameIndex;
     public float4x4 prevViewProj;
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint64_t entityTableAddr;  // entity geometry table
     public uint     flags;            // bit0 submerged, bit4 waves (bit1 was PBR-toggle, now unconditional)
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
@@ -52,15 +59,10 @@ public struct WorldPush {
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
-    public uint64_t lightBufAddr;     // RIS emitter-NEE global light buffer (0 = none published)
-    public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
-    public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
-    public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
-    public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
     public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
     public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
-    public uint     lightCount;       // packed Light records in lightBufAddr
+    public uint     lightCount;       // packed Light records in pc.lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
 
