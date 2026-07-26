@@ -91,7 +91,7 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
-// Animated primary geometry must never be treated as a stationary raw-accumulation surface.
+// Marks animated primary geometry for checkerboard and raw-history classification.
 public static const uint PAYLOAD_DYNAMIC_SURFACE = 1u << 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;
 public static const uint EMISSION_SOURCE_UNIFORM = 1u;
