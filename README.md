@@ -46,6 +46,16 @@ changes while the renderer is being built.
 4. Launch the game with the Vulkan graphics backend.
 5. Open Video Settings to adjust Caustica's renderer options.
 
+## Building
+
+On Windows, build the mod without NVIDIA NGX/DLSS SDK files with:
+
+```powershell
+.\gradlew.bat build -PnoNgx --console=plain
+```
+
+The built mod JAR is written to `build/libs/`.
+
 ## Usage Notes
 
 - Caustica is client-side only.
@@ -85,6 +95,5 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - [ ] Nether/End sky
 - [x] Overworld weather: biome/location-shaped volumetric cumulus and storm decks, cloud-lit daytime fog, motion-aware animation and matching cloud shadows
-- [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR
