@@ -66,7 +66,7 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 static float3 gv_motionObjDisp;
-// Only immutable primary surfaces are eligible for native raw accumulation.
+// Primary surfaces eligible for depth/normal-validated native raw accumulation.
 static bool gv_historyStable;
 // Dynamic primary pixels must not retain an old native checkerboard phase.
 static bool gv_dynamicSurface;
@@ -956,7 +956,10 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_emissionSource = EMISSION_SOURCE_NONE;
                 gv_hitCamRel = rd * 1.0e6; // sky depth remains at infinity
                 float cloudGuideDistance = payload.motionPrev.x;
-                gv_dynamicSurface = cloudGuideDistance > 0.0;
+                // Clear atmosphere is stable; moving volumetric clouds are not. Clouds deliberately do
+                // not use the sparse-resolve dynamic tag: spatially expanding one cloud ray across an
+                // already valid checkerboard tile creates the long radial streaks seen with ReBLUR.
+                gv_historyStable = cloudGuideDistance <= 0.0;
                 // Opaque cloud pixels reproject at their optical centroid, so camera translation gives
                 // them finite parallax instead of treating the moving world-anchored volume as a star.
                 gv_motionHitCamRel = cloudGuideDistance > 0.0
@@ -991,9 +994,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         if (bounce == 0) {
             gv_emission = payloadEmission();
             gv_emissionSource = payloadEmissionSource();
-            gv_historyStable = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) == 0u
-                    && material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
-            gv_dynamicSurface = !gv_historyStable;
+            // Per-pixel depth/normal validation below safely retains samples on the unchanged parts of an
+            // entity while rejecting limbs/head pixels whose pose changed. Water and particles remain
+            // non-accumulating because their guides do not uniquely identify the animated surface.
+            gv_historyStable = material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
+            gv_dynamicSurface = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) != 0u
+                    || material == MATERIAL_WATER || material == MATERIAL_PARTICLE;
         }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
@@ -1553,7 +1559,9 @@ void main() {
         float4 historySample = rawHistoryColor[pix];
         float3 prev = historySample.rgb;
         nativeSampleCount = clamp(historySample.a, 0.0, 1024.0);
-        float3 previousNormal = rawHistoryNormal[pix].xyz;
+        float4 previousNormalAndState = rawHistoryNormal[pix];
+        float3 previousNormal = previousNormalAndState.xyz;
+        bool previousHistoryStable = previousNormalAndState.w >= 0.0;
         float previousDepth = rawHistoryDepth[pix];
         float currentNormalLength = length(gv_normal);
         float previousNormalLength = length(previousNormal);
@@ -1567,9 +1575,9 @@ void main() {
         float depthDifference = abs(gv_depth - previousDepth) / depthScale;
         bool finiteHistory = nativeSampleCount >= 0.5 && all(isfinite(prev)) && all(prev >= 0.0)
                 && max(prev.x, max(prev.y, prev.z)) < 32768.0;
-        // Animated clouds share the sky guide normal/depth. Averaging them here for 32 frames creates
-        // stationary-camera trails; the active denoiser owns sky temporal reconstruction instead.
-        acceptedHistory = finiteHistory && gv_historyStable && !currentSky
+        // The history alpha distinguishes stable clear sky/surfaces from clouds, water and particles.
+        // This permits clear-sky and entity convergence without ever averaging a moving cloud volume.
+        acceptedHistory = finiteHistory && gv_historyStable && previousHistoryStable
                 && normalAgreement >= 0.82 && depthDifference <= 0.055;
         if (acceptedHistory) {
             float boundedCount = min(nativeSampleCount, 1023.0);
@@ -1585,7 +1593,7 @@ void main() {
     if (accumEnabled) {
         float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, 1024.0) : 1.0;
         rawHistoryColor[pix] = float4(safeRadiance, nextCount);
-        rawHistoryNormal[pix] = gNormal[pix];
+        rawHistoryNormal[pix] = float4(gv_normal, gv_historyStable ? gv_rough : -1.0);
         rawHistoryDepth[pix] = gv_depth;
     }
 }
