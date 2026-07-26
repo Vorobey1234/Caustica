@@ -20,7 +20,11 @@ changes while the renderer is being built.
 
 - Vulkan hardware path-traced world rendering
 - Blue-noise sampling for faster convergence
-- Temporal + spatial denoiser (works on AMD and NVIDIA)
+- Denoiser choices: built-in temporal/spatial, NVIDIA NRD, BMFR, and Intel OIDN
+- NRD methods: ReBLUR, ReLAX, and Reference
+- Ray Budget with optional jittered native-pixel phases
+- Experimental Distant Horizons integration: hybrid background and ray-traced LOD geometry
+- Biome-aware volumetric clouds, cloud shadows, rain/thunder sky, and daytime fog
 - Real refraction through glass and water (Fresnel + Snell's law)
 - Real caustics from water and glass surfaces
 - Accumulation mode for noiseless output
@@ -55,6 +59,16 @@ On Windows, build the mod without NVIDIA NGX/DLSS SDK files with:
 ```
 
 The built mod JAR is written to `build/libs/`.
+
+## Recommended settings (1440p)
+
+For the best quality/performance balance, use:
+
+- **NRD:** On
+- **NRD method:** ReBLUR
+- **Realtime Denoiser Resolution:** 80%
+- **Ray Budget:** 1/2
+- **Ray Budget Jitter:** Enabled
 
 ## Usage Notes
 
