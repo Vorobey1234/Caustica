@@ -1273,6 +1273,7 @@ public final class RtComposite {
                 && !RtDistantHorizonsTerrain.INSTANCE.bootstrapComplete();
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
+        RtEntities.FrameEntities frameEntities = null;
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             if (distantHorizonsHybrid) {
@@ -1417,8 +1418,9 @@ public final class RtComposite {
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             List<RtAccel.Instance> staticInstances = RtDistantHorizonsTerrain.INSTANCE.appendInstances(
                     terrain.staticInstances(), terrain.blockX, terrain.blockY, terrain.blockZ);
-            RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, staticInstances,
+            frameEntities = RtEntities.INSTANCE.beginFrame(ctx, staticInstances,
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
+            RtEntities.FrameEntities fe = frameEntities;
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
@@ -1811,6 +1813,7 @@ public final class RtComposite {
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
         long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
+        RtEntities.INSTANCE.markGraphicsUse(frameEntities, graphicsUse);
         pendingTerrainGraphicsUse = graphicsUse;
     }
 

@@ -128,6 +128,14 @@ public final class RtGpuExecutor {
         return queryTimeline(graphicsTimeline);
     }
 
+    /** Wait until the exact graphics submission that last used a reusable owner has completed. */
+    public void awaitGraphicsUse(long graphicsValue) {
+        checkExecutorFailure();
+        if (graphicsValue != 0L && queryTimeline(graphicsTimeline) < graphicsValue) {
+            waitTimeline(graphicsTimeline, graphicsValue);
+        }
+    }
+
     /** Latest reserved graphics submission that can reference the currently published terrain state. */
     public long latestGraphicsUseValue() {
         return latestGraphicsUseValue.get();
