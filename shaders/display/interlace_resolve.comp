@@ -91,7 +91,9 @@ void main() {
             for (int y = 0; y < 2; y++) {
                 ivec2 pixel = origin + ivec2(x, y);
                 if (pixel.y >= size.y || all(equal(pixel, samplePixel))) continue;
-                if (imageLoad(validityImage, pixel).r != 0u) continue;
+                bool valid = imageLoad(validityImage, pixel).r != 0u;
+                bool dynamicHistory = imageLoad(specAlbedoImage, pixel).a < -0.5;
+                if (valid && !dynamicHistory) continue;
                 imageStore(colorImage, pixel, color);
                 imageStore(normalImage, pixel, normal);
                 imageStore(albedoImage, pixel, albedo);
@@ -123,7 +125,9 @@ void main() {
             // Preserve a pixel once its own checkerboard phase has produced a real ray. This is the key
             // difference from nearest-neighbour tile expansion: after divisor frames (with jitter on),
             // every pixel contains native-resolution history and no block-upscaled cells remain.
-            if (imageLoad(validityImage, pixel).r != 0u) continue;
+            bool valid = imageLoad(validityImage, pixel).r != 0u;
+            bool dynamicHistory = imageLoad(specAlbedoImage, pixel).a < -0.5;
+            if (valid && !dynamicHistory) continue;
             imageStore(colorImage, pixel, color);
             imageStore(normalImage, pixel, normal);
             imageStore(albedoImage, pixel, albedo);

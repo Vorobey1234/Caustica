@@ -68,6 +68,8 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 static float3 gv_motionObjDisp;
 // Only immutable primary surfaces are eligible for native raw accumulation.
 static bool gv_historyStable;
+// Dynamic primary pixels must not retain an old native checkerboard phase.
+static bool gv_dynamicSurface;
 
 uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
 uint payloadEmissionSource() {
@@ -859,6 +861,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                  out float firstIndirectHitDistance) {
     firstIndirectHitDistance = 0.0;
     gv_historyStable = false;
+    gv_dynamicSurface = false;
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
     float rayConeWidth = 0.0;
@@ -905,6 +908,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_emissionSource = EMISSION_SOURCE_NONE;
                 gv_hitCamRel = rd * 1.0e6; // sky depth remains at infinity
                 float cloudGuideDistance = payload.motionPrev.x;
+                gv_dynamicSurface = cloudGuideDistance > 0.0;
                 // Opaque cloud pixels reproject at their optical centroid, so camera translation gives
                 // them finite parallax instead of treating the moving world-anchored volume as a star.
                 gv_motionHitCamRel = cloudGuideDistance > 0.0
@@ -941,6 +945,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
             gv_emissionSource = payloadEmissionSource();
             gv_historyStable = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) == 0u
                     && material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
+            gv_dynamicSurface = !gv_historyStable;
         }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
@@ -1436,7 +1441,8 @@ void main() {
     // Alpha is unused by DLSS/OIDN (both consume RGB); reserve it for the NRD in-lobe hit distance.
     gAlbedo[pix] = float4(gv_albedo, nrdHitDistance);
     gDepth[pix] = gv_depth;
-    gSpecAlbedo[pix] = float4(gv_specAlb, 1.0); // specular albedo for RR demodulation
+    // Alpha is an internal sparse-resolve tag; denoisers consume only the RGB guide.
+    gSpecAlbedo[pix] = float4(gv_specAlb, gv_dynamicSurface ? -1.0 : 1.0);
 
     // Motion vector: reproject this guide point through the previous frame's view-projection.
     // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is

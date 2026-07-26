@@ -22,6 +22,7 @@ import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -721,17 +722,21 @@ public final class RtEntities {
                 RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
             }
             curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
+            // Living models deform every frame. Give each captured pose its own transient BLAS so the
+            // RT queue can never observe a half-refitted body paired with a newer head pose.
+            boolean living = entity instanceof LivingEntity;
             // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
             // re-references that AS through the instance transform — no upload, no refit.
             boolean reused;
             long reuseStart = RtFrameStats.FRAME.startStage();
             try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+                reused = !living
+                        && appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
             }
             if (!reused) {
-                appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
+                appendCapture(ctx, build, motion, living ? -1 : id, ENTITY_BIT, mask,
                         translationTransform(ix - rbx, iy - rby, iz - rbz));
             }
             build.logicalCount++;
