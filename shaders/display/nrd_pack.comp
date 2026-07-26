@@ -1,0 +1,72 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D noisyColor;
+layout(binding = 1, r32f) uniform readonly image2D hardwareDepth;
+layout(binding = 2, rgba16f) uniform readonly image2D sourceNormalRoughness;
+layout(binding = 3, rgba16f) uniform writeonly image2D radianceHitDistance;
+layout(binding = 4, rgba16f) uniform writeonly image2D packedNormalRoughness;
+layout(binding = 5, r32f) uniform writeonly image2D linearViewZ;
+layout(binding = 6, rgba16f) uniform readonly image2D diffuseAlbedoAndNrdHitDistance;
+
+layout(push_constant) uniform Push {
+    mat4 inverseProjection;
+    int method; // 0 = ReLAX, 1 = ReBLUR, 2 = Reference
+} pc;
+
+// NRD deliberately does not write pixels outside denoisingRange.  Keep this well below
+// FP16's maximum so the resolve pass can reliably distinguish a sky/miss from geometry.
+const float NRD_DENOISING_RANGE = 50000.0;
+// RELAX stores luminance moments in FP16. Caustica's unexposed HDR beauty can be much brighter
+// than RELAX's supported [0, 250] range, so keep its input below 128 and restore the scale later.
+const float RELAX_RADIANCE_SCALE = 1.0 / 512.0;
+
+vec3 linearToYCoCg(vec3 color) {
+    return vec3(dot(color, vec3(0.25, 0.5, 0.25)),
+                dot(color, vec3(0.5, 0.0, -0.5)),
+                dot(color, vec3(-0.25, 0.5, -0.25)));
+}
+
+// NRD 4.17.3 is built with NRD_NORMAL_ENCODING_RGBA16_SNORM and linear roughness.
+// Its frontend packer stores a best-fit signed normal (normal / max(abs(normal))) rather than
+// a unit vector. Passing Caustica's raw world normal here was invalid NRD input and caused history
+// rejection/unstable colours.
+vec3 packNrdNormal(vec3 normal) {
+    float maxComponent = max(abs(normal.x), max(abs(normal.y), abs(normal.z)));
+    return maxComponent > 1.0e-6 ? normal / maxComponent : vec3(0.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(noisyColor);
+    if (any(greaterThanEqual(pixel, size))) return;
+
+    float depth = imageLoad(hardwareDepth, pixel).r;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 view = pc.inverseProjection * vec4(ndc, depth, 1.0);
+    float viewZ = abs(view.z / max(abs(view.w), 1.0e-7));
+    if (depth <= 1.0e-7 || isnan(viewZ) || isinf(viewZ)) viewZ = NRD_DENOISING_RANGE + 1.0;
+    else viewZ = clamp(viewZ, 0.0, NRD_DENOISING_RANGE - 1.0);
+
+    vec3 radiance = clamp(imageLoad(noisyColor, pixel).rgb, vec3(0.0), vec3(65504.0));
+    if (pc.method == 0) radiance *= RELAX_RADIANCE_SCALE;
+    vec4 sourceGuide = imageLoad(sourceNormalRoughness, pixel);
+    imageStore(packedNormalRoughness, pixel,
+            vec4(packNrdNormal(sourceGuide.rgb), clamp(sourceGuide.a, 0.0, 1.0)));
+    // Both methods use the first indirect (in-lobe) path distance, never primary camera depth.
+    float hitDistance = clamp(imageLoad(diffuseAlbedoAndNrdHitDistance, pixel).a,
+            0.0, NRD_DENOISING_RANGE - 1.0);
+    if (pc.method == 1) {
+        // ReBLUR's diffuse lobe uses roughness=1. Its SDK default normalization parameters are
+        // A=3, B=0.1, C=20; at roughness 1 the magic-curve factor is 1, hence f=A+|Z|*B.
+        float normalizedHitDistance = max(clamp(hitDistance / (3.0 + abs(viewZ) * 0.1), 0.0, 1.0),
+                1.0e-6);
+        imageStore(radianceHitDistance, pixel,
+                vec4(linearToYCoCg(radiance), normalizedHitDistance));
+    } else {
+        imageStore(radianceHitDistance, pixel, vec4(radiance, hitDistance));
+    }
+    imageStore(linearViewZ, pixel, vec4(viewZ));
+}

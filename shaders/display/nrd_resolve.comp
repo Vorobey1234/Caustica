@@ -1,0 +1,39 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// signal contains the unfiltered radiance in RGB.  NRD leaves sky/miss pixels undefined,
+// because their view-Z is intentionally beyond denoisingRange, so those pixels must come
+// from the source rather than from OUT_DIFF_RADIANCE_HITDIST.
+layout(binding = 0, rgba16f) uniform readonly image2D signal;
+layout(binding = 1, r32f) uniform readonly image2D linearViewZ;
+layout(binding = 2, rgba16f) uniform readonly image2D denoised;
+layout(binding = 3, rgba16f) uniform writeonly image2D outputColor;
+
+layout(push_constant) uniform Push {
+    float denoisingRange;
+    int method; // 0 = ReLAX, 1 = ReBLUR, 2 = Reference
+} pc;
+
+const float RELAX_RADIANCE_SCALE = 1.0 / 512.0;
+
+vec3 yCoCgToLinear(vec3 color) {
+    float t = color.x - color.z;
+    return max(vec3(t + color.y, color.x + color.z, t - color.y), vec3(0.0));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputColor);
+    if (any(greaterThanEqual(pixel, size))) return;
+
+    float viewZ = imageLoad(linearViewZ, pixel).r;
+    vec3 color = pc.method == 2 || abs(viewZ) < pc.denoisingRange
+            ? imageLoad(denoised, pixel).rgb
+            : imageLoad(signal, pixel).rgb;
+    if (pc.method == 1) color = yCoCgToLinear(color);
+    if (pc.method == 0) color /= RELAX_RADIANCE_SCALE;
+    // Caustica's beauty output is opaque. Keeping alpha deterministic also prevents a stale
+    // alpha channel from being interpreted by later compositing passes.
+    imageStore(outputColor, pixel, vec4(color, 1.0));
+}

@@ -103,37 +103,14 @@ final class RtTerrainMesher {
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
-        // RIS emitter-NEE light collection — BEFORE packing: it also stamps NEE membership into the prim
-        // records, which packSection then copies out. Only opaque + cutout can emit (glass is shaded
-        // emission-free, water never emits; lava lives in the opaque bucket).
-        float[] lights = EMPTY_LIGHTS;
-        if (CausticaConfig.Rt.Lights.RIS_CANDIDATES.value() > 0) {
-            FloatArrayList collected = new FloatArrayList();
-            float minFill = CausticaConfig.Rt.Lights.MIN_FILL_RATIO.value();
-            collectLights(collected, mesh.opaque, materials, minFill);
-            collectLights(collected, mesh.cutout, materials, minFill);
-            if (!collected.isEmpty()) {
-                lights = collected.toFloatArray();
-            }
-        }
         Geom cutout = mesh.cutoutOrEmpty();
         RtAccel.OpacityMicromapInput ommInput =
                 RtTerrainOmm.buildInput(cutout.triCount(), cutout.cornerUv.elements(),
                         cutout.ommSprites.elements(), cutout.ommSprites.size());
-        return new CpuSection(packSection(mesh, lights), ommInput);
+        return new CpuSection(packSection(mesh), ommInput);
     }
 
-    private static final float[] EMPTY_LIGHTS = new float[0];
-
-    private static void collectLights(FloatArrayList out, Geom geom,
-                                      RtMaterialRegistry.Snapshot materials, float minFillRatio) {
-        if (geom != null && !geom.idx.isEmpty()) {
-            RtLightCollector.collectBucket(out, geom.verts, geom.prim, geom.cornerUv,
-                    geom.ommSprites.elements(), materials, minFillRatio);
-        }
-    }
-
-    private static PackedSection packSection(SectionMesh mesh, float[] lights) {
+    private static PackedSection packSection(SectionMesh mesh) {
         Geom[] buckets = mesh.buckets(); // { solid, cutout, translucent, water }, indexed by RtAccel.BUCKET_*
         int vertFloats = 0, idxCount = 0, uvFloats = 0, primFloats = 0, triCount = 0;
         int[] bucketTris = new int[buckets.length];
@@ -178,7 +155,7 @@ final class RtTerrainMesher {
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
         }
-        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase, lights);
+        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase);
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -236,10 +213,9 @@ final class RtTerrainMesher {
     record CpuSection(PackedSection packed, RtAccel.OpacityMicromapInput opacityMicromap) {
     }
 
-    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays.
-     *  {@code lights} = packed section-local RIS light records (possibly empty), CPU-side only. */
+    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                         int[] bucketTris, int[] triBase, float[] lights) {
+                         int[] bucketTris, int[] triBase) {
     }
 
 
@@ -438,10 +414,15 @@ final class RtTerrainMesher {
             float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
             if (len > 1.0e-6f) { nx /= len; ny /= len; nz /= len; }
             q.nx = nx; q.ny = ny; q.nz = nz;
+            q.tangentFrame = packTangentFrame(q);
 
             ChunkSectionLayer layer = quad.chunkLayer();
             q.cutout = layer != ChunkSectionLayer.SOLID;
-            q.translucent = layer == ChunkSectionLayer.TRANSLUCENT;
+            // Only classify as a thin-dielectric (MODEL_GLASS) when the block itself is genuinely a
+            // glass/ice/etc. block. A resource pack that mislabels cutout foliage or solid stairs as
+            // TRANSLUCENT would otherwise make those blocks render as glossy semi-transparent glass.
+            q.translucent = layer == ChunkSectionLayer.TRANSLUCENT
+                    && RtMaterials.isThinDielectric(state);
 
             // Fabric colors are authored albedo. Continuity uses them for already-resolved overlay tint;
             // ordinary biome-tinted quads retain tintIndex and are multiplied by the world tint below.
@@ -628,7 +609,9 @@ final class RtTerrainMesher {
                 prim.add(q.tb);
                 prim.add(0f);
                 prim.add(Float.intBitsToFloat(q.materialId)); // TerrainPrim.materialId uint bits
-                prim.add(0f); // flags
+                // One quad-stable tangent frame shared by both triangles. Computing this independently
+                // from fetched triangle positions in the hit shader caused diagonal normal-map seams.
+                prim.add(Float.intBitsToFloat(q.tangentFrame)); // flags
                 prim.add(0f); // aux0
                 prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
@@ -646,7 +629,47 @@ final class RtTerrainMesher {
         boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
         float tr, tg, tb, emission;
         int materialId;
+        int tangentFrame;
         TextureAtlasSprite sprite;
+    }
+
+    private static int packTangentFrame(PendingQuad q) {
+        float u0 = Float.intBitsToFloat((int) (q.uv[0] >>> 32));
+        float v0 = Float.intBitsToFloat((int) q.uv[0]);
+        float u1 = Float.intBitsToFloat((int) (q.uv[1] >>> 32));
+        float v1 = Float.intBitsToFloat((int) q.uv[1]);
+        float u2 = Float.intBitsToFloat((int) (q.uv[2] >>> 32));
+        float v2 = Float.intBitsToFloat((int) q.uv[2]);
+        float du1 = u1 - u0, dv1 = v1 - v0;
+        float du2 = u2 - u0, dv2 = v2 - v0;
+        float det = du1 * dv2 - dv1 * du2;
+        if (Math.abs(det) <= 1.0e-12f) return 0;
+
+        float ex1 = q.x[1] - q.x[0], ey1 = q.y[1] - q.y[0], ez1 = q.z[1] - q.z[0];
+        float ex2 = q.x[2] - q.x[0], ey2 = q.y[2] - q.y[0], ez2 = q.z[2] - q.z[0];
+        float invDet = 1.0f / det;
+        float tx = (ex1 * dv2 - ex2 * dv1) * invDet;
+        float ty = (ey1 * dv2 - ey2 * dv1) * invDet;
+        float tz = (ez1 * dv2 - ez2 * dv1) * invDet;
+        float ndt = q.nx * tx + q.ny * ty + q.nz * tz;
+        tx -= q.nx * ndt; ty -= q.ny * ndt; tz -= q.nz * ndt;
+        float tlen = (float) Math.sqrt(tx * tx + ty * ty + tz * tz);
+        if (tlen <= 1.0e-7f) return 0;
+        tx /= tlen; ty /= tlen; tz /= tlen;
+
+        float bx = (-ex1 * du2 + ex2 * du1) * invDet;
+        float by = (-ey1 * du2 + ey2 * du1) * invDet;
+        float bz = (-ez1 * du2 + ez2 * du1) * invDet;
+        float cx = q.ny * tz - q.nz * ty;
+        float cy = q.nz * tx - q.nx * tz;
+        float cz = q.nx * ty - q.ny * tx;
+        float handedness = cx * bx + cy * by + cz * bz < 0.0f ? -1.0f : 1.0f;
+        return packSnorm8(tx) | (packSnorm8(ty) << 8) | (packSnorm8(tz) << 16)
+                | (packSnorm8(handedness) << 24);
+    }
+
+    private static int packSnorm8(float value) {
+        return Math.round(Math.max(-1.0f, Math.min(1.0f, value)) * 127.0f) & 0xFF;
     }
 
     /** Append one triangle's 3 corner UVs (6 floats) from packed UVPairs. UVPair packs u in the high 32

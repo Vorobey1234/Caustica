@@ -19,8 +19,11 @@ changes while the renderer is being built.
 ## Features
 
 - Vulkan hardware path-traced world rendering
-- DLSS Ray Reconstruction support
-- DLSS Frame Generation support (experimental)
+- Blue-noise sampling for faster convergence
+- Temporal + spatial denoiser (works on AMD and NVIDIA)
+- Real refraction through glass and water (Fresnel + Snell's law)
+- Real caustics from water and glass surfaces
+- Accumulation mode for noiseless output
 - HDR output
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
@@ -30,7 +33,7 @@ changes while the renderer is being built.
 
 - **Vulkan graphics backend enabled**
 - A GPU and driver with Vulkan ray tracing support
-- NVIDIA RTX GPU and supported driver for DLSS features
+- A GPU with Vulkan ray tracing support (AMD RDNA 2+ or NVIDIA RTX)
 - HDR-capable display and OS HDR mode for HDR output
 - On Linux, an HDR-capable Wayland compositor and a native Wayland session for HDR output
 - Install LabPBR resource pack like [SPBR](https://modrinth.com/resourcepack/spbr) for better visuals
@@ -80,7 +83,8 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
-- [ ] Nether/End sky, weather, volumetric fog/clouds
+- [ ] Nether/End sky
+- [x] Overworld weather: biome/location-shaped volumetric cumulus and storm decks, cloud-lit daytime fog, motion-aware animation and matching cloud shadows
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

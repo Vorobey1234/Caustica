@@ -9,12 +9,13 @@
 // disc isn't double-counted against the direct light → fireflies). The atmosphere gradient + stars are
 // added on every miss (any bounce): stars aren't a NEE light, so they never double-count.
 import world_common;
+import cloud_common;
 
 [[vk::push_constant]] WorldPushConstants pc;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
-[[vk::binding(9, 0)]] Sampler2D celestialsAtlas;
+[[vk::binding(12, 0)]] Sampler2D celestialsAtlas;
 
 static const float PI = 3.14159265359;
 float pow2(float x) { return x * x; }
@@ -23,7 +24,7 @@ float pow2(float x) { return x * x; }
 // transmittanceToSpace(dir) at draw time — at noon the sun reads warm-white, at the horizon it reddens
 // on exactly the sky's own sunset curve.
 static const float3 SUN_DISC_RADIANCE  = float3(24.0, 23.0, 21.5);
-static const float3 MOON_DISC_RADIANCE = float3(1.7, 1.85, 2.2) / 4.0; // lit-side moon (HDR, bright at night exposure)
+static const float3 MOON_DISC_RADIANCE = float3(1.7, 1.85, 2.2); // lit-side moon (HDR, bright at night exposure)
 // Vibrance applied to the atmosphere in-scatter only (not discs/stars/night ambient): luminance-
 // preserving, so GI energy is unchanged.
 static const float SKY_SATURATION = 1.2;
@@ -31,9 +32,9 @@ static const float SKY_SATURATION = 1.2;
 // distance 100 → half-angle = atan(0.30) / atan(0.20). Decoupled from the NEE light radius (≈0.6°).
 static const float SUN_DISC_HALF_ANGLE  = 0.29146; // atan(30/100), vanilla sun size
 static const float MOON_DISC_HALF_ANGLE = 0.19740; // atan(20/100), vanilla moon size
-// Faint night-sky ambient so the night isn't pure black where the atmosphere in-scatter falls to zero.
-static const float3 NIGHT_ZENITH  = float3(0.004, 0.008, 0.022) / 5.0;
-static const float3 NIGHT_HORIZON = float3(0.015, 0.022, 0.045) / 5.0;
+// Intentionally black night sky: only explicitly visible celestial discs remain.
+static const float3 NIGHT_ZENITH  = float3(0.0);
+static const float3 NIGHT_HORIZON = float3(0.0);
 
 // ---- Physically-based atmosphere (Nishita / O'Neil single scattering + ozone absorption). A view ray
 // is marched through the atmospheric shell; at each step the transmittance toward the sun is integrated
@@ -219,6 +220,82 @@ float3 stars(float3 dir, float starBrightness, float VdotS, float4 celestial) {
     return 0.2 * star * starCol * starBrightness;
 }
 
+// Sparse world-space precipitation visible on rays that escape to the sky. The
+// longitude/latitude grid keeps drops fixed in world direction while the vertical
+// phase falls with time; temporal denoising then integrates their thin coverage.
+float rainStreaks(float3 dir, float time) {
+    float2 uv = float2(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5,
+            asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5);
+    float2 grid = uv * float2(240.0, 72.0);
+    grid.y += time * 22.0;
+    float2 cell = floor(grid);
+    float2 local = frac(grid);
+    float random = hash13(float3(cell, floor(time * 0.25)));
+    if (random < 0.965) return 0.0;
+    float center = 0.15 + 0.7 * hash13(float3(cell + 17.0, 3.0));
+    float thin = 1.0 - smoothstep(0.008, 0.035, abs(local.x - center));
+    float lengthFade = smoothstep(0.0, 0.18, local.y) * (1.0 - smoothstep(0.72, 1.0, local.y));
+    return thin * lengthFade;
+}
+
+// Deterministic front-to-back integration of the shared cloud field. A density-weighted optical
+// centroid is returned for primary-sky motion reprojection; secondary rays simply consume the colour.
+void compositeVolumetricClouds(inout float3 col, float3 rayOrigin, float3 rayDir, float3 sunDir,
+                               float day, float thunder, CloudParams params,
+                               out float transmittance, out float cloudDistance) {
+    transmittance = 1.0;
+    cloudDistance = 0.0;
+    float t0, t1;
+    if (!cloudInterval(rayOrigin, rayDir, t0, t1)) return;
+    const int STEPS = 14;
+    float stepLength = (t1 - t0) / float(STEPS);
+    // A fixed midpoint lattice turns density transitions into camera-centred contour rings. Offset the
+    // whole stratified march with a world/cloud-stable hash of the layer entry point: the bias becomes
+    // fine stochastic detail instead of coherent circles and it advects together with the cloud field.
+    float3 entryPos = rayOrigin + rayDir * t0;
+    float marchJitter = cloudHash21(floor(cloudAbsoluteXZ(entryPos, params) * 0.5));
+    float3 integrated = float3(0.0, 0.0, 0.0);
+    float opacitySum = 0.0;
+    float distanceSum = 0.0;
+    float forward = pow(max(dot(rayDir, sunDir), 0.0), 14.0);
+    float3 nightAmbient = float3(0.006, 0.010, 0.022);
+    float3 dayAmbient = lerp(float3(0.28, 0.35, 0.46), float3(0.10, 0.13, 0.18), thunder);
+    float3 ambient = lerp(nightAmbient, dayAmbient, day);
+    float3 sunTint = lerp(float3(1.0, 0.52, 0.24), float3(0.98, 0.96, 0.90),
+            clamp(sunDir.y * 3.0, 0.0, 1.0));
+    for (int i = 0; i < STEPS; ++i) {
+        float sampleT = t0 + (float(i) + marchJitter) * stepLength;
+        float3 samplePos = rayOrigin + rayDir * sampleT;
+        float density = cloudDensity(samplePos, params);
+        float alpha = 1.0 - exp(-density * CLOUD_SIGMA_T * stepLength);
+        float sunProbe = sunDir.y > -0.02
+                ? 0.55 * cloudDensity(samplePos + sunDir * 58.0, params)
+                    + 0.45 * cloudDensity(samplePos + sunDir * 138.0, params) : 1.0;
+        float sunVisibility = exp(-sunProbe * 2.8);
+        float heightLight = saturate((samplePos.y - CLOUD_MIN_Y) / (CLOUD_MAX_Y - CLOUD_MIN_Y));
+        float3 cloudBaseTint = lerp(float3(0.46, 0.54, 0.68), float3(1.0, 0.98, 0.92),
+                smoothstep(0.12, 0.86, heightLight));
+        float3 lighting = ambient * cloudBaseTint + sunTint * day
+                * ((0.18 + 0.72 * sunVisibility) * (0.34 + 0.34 * heightLight)
+                    + forward * sunVisibility * 0.34);
+        float contribution = transmittance * alpha;
+        integrated += lighting * contribution;
+        opacitySum += contribution;
+        distanceSum += sampleT * contribution;
+        transmittance *= 1.0 - alpha;
+        if (transmittance < 0.015) break;
+    }
+    // A finite Minecraft cloud layer intersects near-horizontal view rays at a nearly constant screen
+    // height. Without atmospheric blending this reads as a hard, perfectly straight shelf at the
+    // horizon. Fade the *cloud contribution* into the already-scattered sky over a broad elevation
+    // range; the volume still casts shadows and retains its full body overhead.
+    float horizonBlend = smoothstep(-0.07, 0.19, rayDir.y);
+    transmittance = lerp(1.0, transmittance, horizonBlend);
+    integrated *= horizonBlend;
+    col = col * transmittance + integrated;
+    if (opacitySum > 0.08) cloudDistance = distanceSum / opacitySum;
+}
+
 [shader("miss")]
 void main(inout Payload payload) {
     WorldPush worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
@@ -228,7 +305,10 @@ void main(inout Payload payload) {
     float SdotU = sd.y;
     float VdotS = dot(dir, sd);
     float sunUp = clamp((SdotU + 0.0625) / 0.125, 0.0, 1.0); // 0 well below horizon .. 1 above
-    float starBrightness = worldPush.lightRadiance.w;
+    float rain = clamp(worldPush.weather.x, 0.0, 1.0);
+    float thunder = clamp(worldPush.weather.y, 0.0, 1.0);
+    float overcast = clamp(worldPush.weather.z, 0.0, 1.0);
+    float starBrightness = worldPush.lightRadiance.w * (1.0 - overcast);
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
 
     // Physically-based in-scattering: blue zenith, bright/desaturated horizon, warm Mie halo + red
@@ -255,7 +335,27 @@ void main(inout Payload payload) {
     float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
     col += nightAmbient * (1.0 - day);
     col *= downFade;
-    col += stars(dir, starBrightness, VdotS, worldPush.celestial);
+    // Keep the sky clean black at night rather than adding a procedurally bright star layer.
+
+    // Weather is driven by Minecraft's interpolated rain/thunder state. Dense cloud
+    // cover desaturates the atmosphere toward a height-dependent overcast luminance;
+    // thunder further lowers the cloud base without making the scene pitch black.
+    float horizon = 1.0 - clamp(abs(dir.y), 0.0, 1.0);
+    float stormAmount = max(rain, thunder);
+    float stormDarkening = 1.0 - 0.82 * stormAmount;
+    float3 overcastSky = lerp(float3(0.008, 0.010, 0.014),
+            float3(0.028, 0.034, 0.045), horizon) * stormDarkening;
+    col = lerp(col, overcastSky, saturate(overcast * 0.94 + rain * 0.06));
+    CloudParams cloudParams;
+    cloudParams.weather = worldPush.weather;
+    cloudParams.climate = worldPush.cloudParams.xy;
+    cloudParams.worldOrigin = worldPush.cloudParams.zw;
+    float cloudTransmittance;
+    float cloudDistance;
+    compositeVolumetricClouds(col, WorldRayOrigin(), dir, sd, day, thunder, cloudParams,
+            cloudTransmittance, cloudDistance);
+    float drops = rainStreaks(dir, worldPush.weather.w) * rain;
+    col += float3(0.22, 0.24, 0.26) * drops * (0.35 + 0.65 * horizon);
 
     // Sun & moon discs — sampled from the vanilla celestials atlas, gated to rays that haven't already
     // accounted for the light via diffuse NEE. squareBody gives the body-local [-1,1] coord; the
@@ -271,7 +371,7 @@ void main(inout Payload payload) {
             // survives, the halo collapses to ~0.
             float core = pow(clamp(dot(t, t) * 0.45, 0.0, 1.0), 6.0);
             // transmittanceToSpace reddens+dims the disc through the sunset on the sky's own curve.
-            col += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp;
+            col += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp * cloudTransmittance;
         }
         // Same horizon gate as the sun: with the soft-horizon change, below-horizon rays no longer clip
         // at the planet, so without this the moon disc would stay visible after it set.
@@ -283,18 +383,17 @@ void main(inout Payload payload) {
             // Moon: a smoothstep contrast ramp suppresses the faint halo while keeping the lit phase
             // shape from the texture. The transmittance tint gives a warm amber moon at moonrise/set.
             float m = smoothstep(0.0, 1.0, min(length(t), 1.0)) * 1.3;
-            col += MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m * pow2(1.0 - day) * moonUp;
+            col += MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m * pow2(1.0 - day) * moonUp * cloudTransmittance;
         }
     }
 
-    // albedo is a half3 lane, so the sky's HDR radiance is clamped to half's finite range rather than
-    // allowed to round up to +inf and propagate as NaN through the path throughput. This is a guard, not
-    // a correction: the brightest term here is SUN_DISC_RADIANCE at 24.0, far under the 65504 ceiling.
-    payload.albedo = half3(clamp(col, float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)));
+    payload.albedo = max(col, float3(0.0, 0.0, 0.0)); // raygen reads this as sky radiance + bounce-0 guide
     payload.hitT = -1.0;
-    payload.normal = half3(0.0h, 0.0h, 0.0h);
-    payload.motionPrev = half3(0.0h, 0.0h, 0.0h);
-    payload.f0 = half3(0.0h, 0.0h, 0.0h);
+    payload.normal = float3(0.0, 0.0, 0.0);
+    // x carries the cloud optical centroid on a miss. Raygen uses it only for primary-sky motion;
+    // closest-hit stages overwrite this lane for geometry.
+    payload.motionPrev = float3(cloudDistance, 0.0, 0.0);
+    payload.f0 = float3(0.0, 0.0, 0.0);
     payload.flags = 0u;
     payload.roughMetal = packHalf2(float2(1.0, 0.0));
     payload.emissionSss = packHalf2(float2(0.0, 0.0));

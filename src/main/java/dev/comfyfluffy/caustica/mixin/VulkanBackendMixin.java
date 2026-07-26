@@ -9,6 +9,7 @@ import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.vulkan.VulkanBackend;
 import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
+import com.mojang.blaze3d.vulkan.init.VulkanPNextStruct;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
@@ -18,6 +19,7 @@ import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkDeviceCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
+import org.lwjgl.vulkan.VkPhysicalDeviceExtendedDynamicStateFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -31,6 +33,10 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import static org.lwjgl.vulkan.EXTExtendedDynamicState.VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
+import static org.lwjgl.vulkan.EXTExtendedDynamicState.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+import static org.lwjgl.vulkan.KHRCopyCommands2.VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME;
 
 /**
  * Vulkan device-negotiation hook: adds the device extensions the Caustica runtime needs to the extension
@@ -46,15 +52,24 @@ import java.util.Set;
  */
 @Mixin(VulkanBackend.class)
 public abstract class VulkanBackendMixin {
+	private static final VulkanPNextStruct EXTENDED_DYNAMIC_STATE_FEATURES_STRUCT = new VulkanPNextStruct(
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+			VkPhysicalDeviceExtendedDynamicStateFeaturesEXT.SIZEOF);
 	private static final VulkanFeature STORAGE_IMAGE_WRITE_WITHOUT_FORMAT =
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat",
 					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEWRITEWITHOUTFORMAT);
 	private static final List<VulkanFeature> SDK_SHADER_FEATURES = List.of(
 			STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16),
-			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));
+			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16),
+			new VulkanFeature(EXTENDED_DYNAMIC_STATE_FEATURES_STRUCT, "extendedDynamicState",
+					VkPhysicalDeviceExtendedDynamicStateFeaturesEXT.EXTENDEDDYNAMICSTATE));
 
 	private static final List<String> CAUSTICA_WANTED_EXTENSIONS = List.of(
+			// NRI (NRD) wraps the existing Vulkan 1.2 logical device and resolves the EXT aliases
+			// for commands promoted to Vulkan 1.3.
+			VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+			VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,
 			// FFX (FSR)
 			"VK_KHR_get_memory_requirements2",
 			"VK_KHR_dedicated_allocation",

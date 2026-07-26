@@ -1,12 +1,12 @@
 package dev.comfyfluffy.caustica.client;
 
 /**
- * Sub-pixel camera jitter for DLSS Ray Reconstruction.
+ * Bounded sub-pixel camera-ray jitter for DLSS Ray Reconstruction and sparse Ray Budget sampling.
  *
  * <p>Generates a Halton(2,3) low-discrepancy sequence in render-pixel space, with the DLSS phase-count
  * rule {@code ceil(8 * (display/render)^2)} and RR's recommended floor of 32 phases.
- * {@link dev.comfyfluffy.caustica.rt.RtComposite} reads the per-frame offset, applies it to the primary ray in the
- * path-tracing shader, and reports it to DLSS-RR's evaluate.
+ * {@link dev.comfyfluffy.caustica.rt.RtComposite} reads the per-frame offset and applies it inside the
+ * selected native pixel. DLSS-RR also receives the same offset in its evaluate call.
  */
 public final class CausticaJitter {
 	public static final CausticaJitter INSTANCE = new CausticaJitter();

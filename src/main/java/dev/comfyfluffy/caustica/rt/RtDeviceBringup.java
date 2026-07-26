@@ -126,6 +126,16 @@ public final class RtDeviceBringup {
 
     private static volatile boolean rtRequested;
     private static volatile SerBackend serBackend = SerBackend.NONE;
+    private static final int VENDOR_ID_AMD = 0x1002;
+    /**
+     * AMD RDNA2/RDNA3 drivers have produced device faults while traversing terrain BLASes that carry
+     * VK_EXT_opacity_micromap attachments (invalid reads around the OMM triangle array). Keep the
+     * extension disabled on AMD unless the user explicitly opts into the unsafe diagnostic override.
+     * The normal any-hit alpha path remains fully functional, only slightly slower on cutout blocks.
+     */
+    private static final String OMM_AMD_UNSAFE_OVERRIDE = "caustica.rt.ommAllowAmdUnsafe";
+    private static final String AMD_UNSAFE_RESERVOIR_OVERRIDE = "caustica.rt.amdUnsafeReservoirShader";
+    private static volatile boolean amdDevice;
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
     private static volatile boolean reflexEnabled; // VK_NV_low_latency2 actually enabled on the device
     private static volatile boolean presentIdEnabled; // VK_KHR_present_id actually enabled on the device
@@ -247,7 +257,31 @@ public final class RtDeviceBringup {
     }
 
     public static String worldRaygenShader() {
+        if (amdSafeShaderPath()) {
+            return "world_amd.rgen.spv";
+        }
         return serBackend.worldRaygenShader;
+    }
+
+    /**
+     * RDNA Windows drivers have crashed in vkCreateRayTracingPipelinesKHR while compiling the full
+     * dynamically-indexed many-light reservoir raygen. Use the smaller constant-index shader family by
+     * default on AMD; the override exists only for driver regression testing.
+     */
+    public static boolean amdSafeShaderPath() {
+        return amdDevice && !Boolean.getBoolean(AMD_UNSAFE_RESERVOIR_OVERRIDE);
+    }
+
+    public static String worldMissShader() {
+        return amdSafeShaderPath() ? "world_amd.rmiss.spv" : "world.rmiss.spv";
+    }
+
+    public static String worldClosestHitShader() {
+        return amdSafeShaderPath() ? "world_amd.rchit.spv" : "world.rchit.spv";
+    }
+
+    public static String worldAnyHitShader() {
+        return amdSafeShaderPath() ? "world_amd.rahit.spv" : "world.rahit.spv";
     }
 
     public static boolean serNvEnabled() {
@@ -442,6 +476,18 @@ public final class RtDeviceBringup {
         return CausticaConfig.Rt.Omm.ENABLED.value();
     }
 
+    private static boolean ommSafeForDevice(VulkanPhysicalDevice physicalDevice) {
+        int vendorId = physicalDevice.vkPhysicalDeviceProperties().vendorID();
+        if (vendorId != VENDOR_ID_AMD) {
+            return true;
+        }
+        return Boolean.getBoolean(OMM_AMD_UNSAFE_OVERRIDE);
+    }
+
+    private static boolean ommRequestedForDevice(VulkanPhysicalDevice physicalDevice) {
+        return ommRequested() && ommSafeForDevice(physicalDevice);
+    }
+
     private static boolean reflexRequested() {
         return CausticaConfig.Rt.Reflex.ENABLED.value();
     }
@@ -465,7 +511,7 @@ public final class RtDeviceBringup {
                 SER_NV_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
 
-            boolean queryOmm = ommRequested()
+            boolean queryOmm = ommRequestedForDevice(physicalDevice)
                     && physicalDevice.hasDeviceExtension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
             if (queryOmm) {
                 OMM_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
@@ -519,6 +565,7 @@ public final class RtDeviceBringup {
         if (!enabledByProperty() || firstUnsupportedExtension(physicalDevice) != null) {
             return;
         }
+        amdDevice = physicalDevice.vkPhysicalDeviceProperties().vendorID() == VENDOR_ID_AMD;
         FeatureSupport support = queryFeatureSupport(physicalDevice);
         if (!support.supportsRt()) {
             return;
@@ -562,6 +609,7 @@ public final class RtDeviceBringup {
             return;
         }
 
+        amdDevice = physicalDevice.vkPhysicalDeviceProperties().vendorID() == VENDOR_ID_AMD;
         FeatureSupport support = queryFeatureSupport(physicalDevice);
         if (!support.supportsRt()) {
             if (!loggedUnavailable) {
@@ -604,7 +652,22 @@ public final class RtDeviceBringup {
 
         // Optional: opacity micromaps (any-hit opt). Only when the gate is on AND the device advertises the
         // extension — its absence must not disable RT, so it is kept out of the mandatory feature set above.
+        // AMD is intentionally excluded by default because observed RDNA driver faults dereference address
+        // zero while traversing OMM-backed terrain BLASes. Fall back to the ordinary any-hit alpha path.
         ommEnabled = support.omm;
+        if (amdSafeShaderPath()) {
+            CausticaMod.LOGGER.warn(
+                    "AMD-safe RT shader path enabled on [{}]: constant-index local lights replace the "
+                            + "24-light dynamic reservoir to avoid a driver crash in vkCreateRayTracingPipelinesKHR; "
+                            + "set -D{}=true only for driver testing",
+                    physicalDevice.deviceName(), AMD_UNSAFE_RESERVOIR_OVERRIDE);
+        }
+        if (ommRequested() && !ommSafeForDevice(physicalDevice)) {
+            CausticaMod.LOGGER.warn(
+                    "Opacity micromaps disabled on AMD device [{}] to prevent Vulkan device faults; "
+                            + "set -D{}=true only for driver testing",
+                    physicalDevice.deviceName(), OMM_AMD_UNSAFE_OVERRIDE);
+        }
         if (ommEnabled) {
             features.add(OMM_FEATURE);
         }

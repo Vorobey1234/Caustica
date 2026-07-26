@@ -1,0 +1,109 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D noisyColor;
+layout(binding = 1, r32f) uniform readonly image2D depth;
+layout(binding = 2, rg16f) uniform readonly image2D motion;
+layout(binding = 3, rgba16f) uniform readonly image2D normals;
+layout(binding = 4, rgba16f) uniform readonly image2D historyColor;
+layout(binding = 5, rgba16f) uniform writeonly image2D outputColor;
+layout(binding = 6, r32f) uniform readonly image2D historyDepth;
+layout(binding = 7, rgba16f) uniform readonly image2D historyNormals;
+
+layout(push_constant) uniform Push {
+    float blendFactor;
+    float depthThreshold;
+    float normalThreshold;
+    float clampScale;
+} pc;
+
+vec3 rgbToYCoCg(vec3 c) {
+    return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+                0.5 * c.r - 0.5 * c.b,
+               -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 yCoCgToRgb(vec3 c) {
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(noisyColor);
+    if (any(greaterThanEqual(pix, size))) return;
+
+    vec4 current = imageLoad(noisyColor, pix);
+    // gMotion uses NRD/DLSS convention: previous = current + motion.
+    // Subtracting sampled the opposite side of moving edges and made entity animation look weak/crooked.
+    vec2 previousPosition = vec2(pix) + 0.5 + imageLoad(motion, pix).xy;
+    ivec2 previousPixel = ivec2(floor(previousPosition));
+    bool onScreen = all(greaterThanEqual(previousPixel, ivec2(0)))
+                 && all(lessThan(previousPixel, size));
+    if (!onScreen) {
+        imageStore(outputColor, pix, current);
+        return;
+    }
+
+    float currentDepth = imageLoad(depth, pix).r;
+    float previousDepth = imageLoad(historyDepth, previousPixel).r;
+    vec3 currentNormal = imageLoad(normals, pix).xyz;
+    vec3 previousNormal = imageLoad(historyNormals, previousPixel).xyz;
+    float currentNormalLength = length(currentNormal);
+    float previousNormalLength = length(previousNormal);
+
+    bool currentSky = currentNormalLength < 0.25;
+    bool previousSky = previousNormalLength < 0.25;
+    float depthScale = max(max(abs(currentDepth), abs(previousDepth)), 1.0e-4);
+    float depthDifference = abs(currentDepth - previousDepth) / depthScale;
+    float normalAgreement = currentSky && previousSky ? 1.0
+            : (!currentSky && !previousSky
+                ? dot(currentNormal / currentNormalLength, previousNormal / previousNormalLength)
+                : -1.0);
+    vec4 reprojectedHistory = imageLoad(historyColor, previousPixel);
+    bool disoccluded = reprojectedHistory.a < 0.5
+            || depthDifference > pc.depthThreshold || normalAgreement < pc.normalThreshold;
+    // Alpha stores temporal sample age (1..32), not radiance. This lets stable pixels converge toward a
+    // long average while disocclusions and lighting changes immediately fall back to the current sample.
+    float historyLength = disoccluded ? 0.0 : clamp(reprojectedHistory.a, 1.0, 32.0);
+
+    // NRD/SVGF-style history rectification: estimate current-frame moments in a 3x3
+    // neighborhood and clip reprojected history to a variance-expanded YCoCg box.
+    vec3 mean = vec3(0.0);
+    vec3 secondMoment = vec3(0.0);
+    int sampleCount = 0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(pix + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 value = rgbToYCoCg(imageLoad(noisyColor, q).rgb);
+            mean += value;
+            secondMoment += value * value;
+            ++sampleCount;
+        }
+    }
+    mean /= float(sampleCount);
+    vec3 sigma = sqrt(max(secondMoment / float(sampleCount) - mean * mean, vec3(0.0)));
+    vec3 extent = max(sigma * max(pc.clampScale, 0.5), vec3(1.0e-4));
+    vec3 history = rgbToYCoCg(reprojectedHistory.rgb);
+    history = clamp(history, mean - extent, mean + extent);
+
+    float statisticallyOptimalWeight = historyLength / (historyLength + 1.0);
+    float historyWeight = disoccluded ? 0.0
+            : min(clamp(pc.blendFactor, 0.0, 0.985), statisticallyOptimalWeight);
+    // Bright outliers converge faster, reducing firefly trails without destabilizing ordinary regions.
+    vec3 currentYCoCg = rgbToYCoCg(current.rgb);
+    float currentLuma = currentYCoCg.x;
+    float outlier = abs(currentLuma - mean.x) / max(sigma.x, 1.0e-3);
+    historyWeight *= 1.0 - 0.45 * smoothstep(2.0, 6.0, outlier);
+
+    // A moving light can change radiance on a perfectly static surface. Compare the reprojected value to
+    // the current distribution so that handheld/dropped lights do not leave a bright temporal trail.
+    float lightingChange = abs(history.x - currentYCoCg.x) / max(sigma.x + 0.08 * max(mean.x, 0.02), 1.0e-3);
+    historyWeight *= 1.0 - 0.80 * smoothstep(1.5, 5.0, lightingChange);
+    float motionMagnitude = length(imageLoad(motion, pix).xy);
+    historyWeight *= 1.0 - 0.35 * smoothstep(1.0, 8.0, motionMagnitude);
+
+    vec3 result = mix(current.rgb, max(yCoCgToRgb(history), vec3(0.0)), historyWeight);
+    float nextHistoryLength = disoccluded ? 1.0 : min(historyLength + 1.0, 32.0);
+    imageStore(outputColor, pix, vec4(result, nextHistoryLength));
+}

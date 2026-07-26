@@ -8,9 +8,9 @@
 //    closest-hit. Opaque entity geometry bypasses this shader; every alpha/transmissive material shares
 //    one non-opaque geometry and routes here through its SBT record.
 //
-// Radiance and shadow rays share the exact Payload ABI, as Vulkan requires for every stage reachable by
-// a trace. Shadow traversal uses albedo.rgb as accumulated transmittance and hitT as the nearest-water
-// crossing; radiance cutout paths do not touch either field.
+// NOTE on the payload: this module declares the SHADOW payload (float4 shadowVis). Radiance rays carry
+// the big Payload struct but only reach the cutout paths here, which never touch the payload — the
+// water/translucent branches that write shadowVis run only from shadow SBT records.
 import world_common;
 
 [[vk::push_constant]] WorldPushConstants pc;
@@ -48,12 +48,61 @@ float alphaDitherThreshold(uint salt) {
 }
 
 [shader("anyhit")]
-void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) {
+void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr) {
     uint pid = PrimitiveIndex();
     float2 attribs = attr.barycentrics;
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
     uint instanceKind = InstanceID() & (ENTITY_BIT | PARTICLE_BIT);
+    if (instanceKind == DH_INSTANCE_KIND) {
+        // Fog-lighting rays use the -2 sentinel. DH geometry must participate so distant buildings
+        // can form god-rays, but use a stochastic coverage test rather than a hard binary blocker. This
+        // preserves broad shafts while breaking up the stair-stepped silhouettes of coarse LOD meshes.
+        bool fogLightingRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u && shadowVis.a < -1.5;
+        WorldPush worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
+        float3 hitPos = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
+        float2 fromCamera = abs(hitPos.xz - worldPush.camOffset.xz);
+        if (max(fromCamera.x, fromCamera.y) <= worldPush.waterAnchor.z) {
+            // Vanilla terrain is authoritative near the current camera. Evaluate this per ray so walking
+            // into a chunk removes stale DH geometry immediately, without waiting for a DH BLAS rebuild.
+            IgnoreHit();
+            return;
+        }
+
+        Section sec = ConstPtr<Section>(pc.dhTableAddr)[InstanceID() & IDX_MASK];
+        uint tri = pid + sec.triBase[GeometryIndex()];
+        TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
+        bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
+        uint dhSurface = uint(pr.tint.w + 0.5);
+        if (fogLightingRay && dhSurface != DH_SURFACE_GLASS && dhSurface != DH_SURFACE_EMISSIVE_GLASS
+                && dhSurface != DH_SURFACE_WATER) {
+            // Stable dither gives coarse DH occluders fractional optical coverage. A deliberately low
+            // blocking ratio keeps broad distant rays visible without turning LOD facades into hard fog masks.
+            float coverage = alphaDitherThreshold(pid ^ (InstanceID() * 1664525u));
+            if (coverage > 0.46) {
+                IgnoreHit();
+                return;
+            }
+            return;
+        }
+        if (dhSurface == DH_SURFACE_WATER && shadowRay) {
+            shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
+            shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
+            IgnoreHit();
+            return;
+        }
+        if ((dhSurface == DH_SURFACE_GLASS || dhSurface == DH_SURFACE_EMISSIVE_GLASS) && shadowRay) {
+            // Preserve transparent sun/sky lighting through far-away windows. The neutral loss keeps
+            // clear panes visible in reflections without turning them into black shadow blockers.
+            float opticalAlpha = clamp(asfloat(dhSurface == DH_SURFACE_EMISSIVE_GLASS
+                    ? pr.aux1 : pr.aux0), 0.04, 0.80);
+            float3 paneTint = lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, opticalAlpha);
+            shadowVis.rgb *= paneTint * 0.94;
+            IgnoreHit();
+            return;
+        }
+        return;
+    }
     if (instanceKind != 0u) {
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[InstanceID() & IDX_MASK];
         pid += g.triBase[GeometryIndex()];
@@ -89,14 +138,14 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
             float3 tint = lerp(float3(1.0, 1.0, 1.0),
                     srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
-            payload.albedo *= half3(tint * clamp(materialHeader.params.w, 0.0, 1.0));
+            shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
             IgnoreHit();
         }
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_WATER) {
             float3 tint = srgbToLinear(texel.rgb) * epr.tint.rgb;
-            payload.albedo *= half3(lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
-                    * clamp(materialHeader.params.w, 0.0, 1.0));
-            payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
+            shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
+                    * clamp(materialHeader.params.w, 0.0, 1.0);
+            shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
             IgnoreHit();
         }
         return;
@@ -110,11 +159,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
-        payload.albedo *= half3(lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT));
-        // Record the NEAREST water crossing (any-hit order is arbitrary) in the shadow payload's hitT
+        shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
+        // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
         // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
         // world.rgen evaluates the wave-refraction caustic. visibility() seeds the -1 sentinel.
-        payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
+        shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
         IgnoreHit();
     }
 
@@ -126,7 +175,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen): a per-channel
     // extinction derived from how dark the average is, scaled by the average alpha (how much of the
     // sprite is glass-colorant vs. see-through frame), so saturated panes darken transmitted light
-    // non-linearly. Multiplying into payload.albedo compounds correctly across stacked panes.
+    // non-linearly. Multiplying into shadowVis.rgb compounds correctly across stacked panes.
     if (bucket == BUCKET_TRANSLUCENT) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
@@ -136,7 +185,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
         // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
         // white/clear-glass case it's meant to cover.
-        payload.albedo *= half3(exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION));
+        shadowVis.rgb *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         IgnoreHit();
     }
 

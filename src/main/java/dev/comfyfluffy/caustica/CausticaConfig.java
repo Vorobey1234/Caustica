@@ -56,10 +56,16 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.RAY_BUDGET_DIVISOR,
+            Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
             Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Composite.ACCUMULATION_ENABLED,
+            Rt.Denoiser.TEMPORAL_ENABLED, Rt.Denoiser.SPATIAL_ENABLED,
+            Rt.Denoiser.BMFR_ENABLED, Rt.Denoiser.NRD_ENABLED, Rt.Denoiser.NRD_METHOD,
+            Rt.Denoiser.OIDN_REALTIME_ENABLED,
+            Rt.Denoiser.REALTIME_RESOLUTION_PERCENT, Rt.Denoiser.OIDN_ENABLED,
         };
     }
 
@@ -96,14 +102,6 @@ public final class CausticaConfig {
         FILE.setComment("reflex",
                 " NVIDIA Reflex (VK_NV_low_latency2). Default off; gated additionally by device support.\n"
                         + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).");
-        FILE.setComment("lights",
-                " RIS direct lighting from block emitters (torches, glowstone, lava, ...): per diffuse\n"
-                        + " vertex, resample ris-candidates power-weighted proposals and spend one shadow ray on\n"
-                        + " the survivor. ris-candidates = 0 disables it entirely (emitters just gather on direct\n"
-                        + " hit, same as with no NEE). Power-weighted sampling and the local per-section light\n"
-                        + " grid are always active whenever RIS is on. min-fill-ratio drops emissive footprints\n"
-                        + " below that fraction of their bounding rectangle (speckle/sparse crossed planes), so\n"
-                        + " only reasonably compact glows become lights. stats/dump/dump-radius are debug logging.");
         FILE.setComment("hdr",
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
@@ -533,8 +531,14 @@ public final class CausticaConfig {
         public static final class Composite {
             public static final IntSetting DEBUG_VIEW = intValue("caustica.rt.debugView", "composite.debug-view", 0);
             public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 1, 1);
+            /** Sparse full-resolution primary-ray rate expressed as one checkerboard/interlaced phase per divisor. */
+            public static final IntSetting RAY_BUDGET_DIVISOR =
+                    clampedInt("caustica.rt.rayBudgetDivisor", "composite.ray-budget-divisor", 1, 1, 16);
+            /** Dephased exact-pixel coverage plus sub-pixel/path jitter; unsafe raw accumulation is bypassed. */
+            public static final BooleanSetting RAY_BUDGET_JITTER =
+                    bool("caustica.rt.rayBudgetJitter", "composite.ray-budget-jitter", false);
             public static final IntSetting MAX_BOUNCES =
-                    clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
+                    clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 0, 64);
             public static final BooleanSetting WATER_WAVES =
                     bool("caustica.rt.waterWaves", "composite.water-waves", true);
             public static final FloatSetting SUN_ANGULAR_RADIUS =
@@ -547,6 +551,8 @@ public final class CausticaConfig {
                     finiteFloat("caustica.rt.jitterSignX", "composite.jitter-sign-x", 1.0f);
             public static final FloatSetting JITTER_SIGN_Y =
                     finiteFloat("caustica.rt.jitterSignY", "composite.jitter-sign-y", -1.0f);
+            public static final BooleanSetting ACCUMULATION_ENABLED =
+                    bool("caustica.rt.accumulation", "composite.accumulation-enabled", false);
 
             private Composite() {
             }
@@ -565,25 +571,8 @@ public final class CausticaConfig {
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =
                     intAtLeast("caustica.rt.rebaseDistanceBlocks", "terrain.rebase-distance-blocks", 128, 0);
-            public static final BooleanSetting BLAS_COMPACTION =
-                    bool("caustica.rt.blasCompaction", "terrain.blas-compaction", true);
 
             private Terrain() {
-            }
-        }
-
-        /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
-        public static final class Lights {
-            public static final IntSetting RIS_CANDIDATES =
-                    intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
-            public static final FloatSetting MIN_FILL_RATIO =
-                    finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
-            public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);
-            public static final BooleanSetting DUMP = bool("caustica.rt.lightDump", "lights.dump", false);
-            public static final IntSetting DUMP_RADIUS =
-                    intAtLeast("caustica.rt.lightDumpRadius", "lights.dump-radius", 12, 1);
-
-            private Lights() {
             }
         }
 
@@ -618,8 +607,8 @@ public final class CausticaConfig {
                     intAtLeast("caustica.rt.beViewChunks", "entities.block-entities.view-chunks", 8, 0);
             public static final IntSetting BE_BUILDS_PER_FRAME =
                     intAtLeast("caustica.rt.beBuildsPerFrame", "entities.block-entities.builds-per-frame", 64, 0);
-            public static final BooleanSetting REFIT_ENABLED =
-                    bool("caustica.rt.entityRefit", "entities.refit.enabled", true);
+            public static final IntSetting REFIT_REBUILD_INTERVAL =
+                    intAtLeast("caustica.rt.refitRebuildInterval", "entities.refit.rebuild-interval", 120, 1);
 
             private Entities() {
             }
@@ -665,6 +654,35 @@ public final class CausticaConfig {
             }
         }
 
+        public static final class Denoiser {
+            public static final BooleanSetting TEMPORAL_ENABLED =
+                    bool("caustica.rt.denoiser.temporal", "denoiser.temporal-enabled", true);
+            public static final BooleanSetting SPATIAL_ENABLED =
+                    bool("caustica.rt.denoiser.spatial", "denoiser.spatial-enabled", true);
+            /** Cross-vendor real-time blockwise feature-regression denoiser. */
+            public static final BooleanSetting BMFR_ENABLED =
+                    bool("caustica.rt.denoiser.bmfr", "denoiser.bmfr-enabled", false);
+            public static final BooleanSetting NRD_ENABLED =
+                    bool("caustica.rt.denoiser.nrd", "denoiser.nrd-enabled", false);
+            /** Selectable methods from NVIDIA's vk_denoise_nrd sample. */
+            public static final StringSetting NRD_METHOD =
+                    string("caustica.rt.denoiser.nrdMethod", "denoiser.nrd-method", "relax",
+                            value -> "reference".equalsIgnoreCase(value) ? "reference"
+                                    : "reblur".equalsIgnoreCase(value) ? "reblur" : "relax");
+            /** Fast OIDN preview at half linear resolution, upscaled on the GPU. */
+            public static final BooleanSetting OIDN_REALTIME_ENABLED =
+                    bool("caustica.rt.denoiser.oidnRealtime", "denoiser.oidn-realtime-enabled", false);
+            /** Shared input resolution for the realtime OIDN and NRD paths. */
+            public static final IntSetting REALTIME_RESOLUTION_PERCENT =
+                    clampedInt("caustica.rt.denoiser.realtimeResolutionPercent",
+                            "denoiser.realtime-resolution-percent", 50, 25, 100);
+            /** CPU/reference backend; deliberately opt-in because it synchronizes GPU readback. */
+            public static final BooleanSetting OIDN_ENABLED =
+                    bool("caustica.rt.denoiser.oidn", "denoiser.oidn-enabled", false);
+            private Denoiser() {
+            }
+        }
+
         /** DLSS Frame Generation. Default off; gated additionally by hardware/driver availability. */
         public static final class Fg {
             public static final BooleanSetting ENABLED = bool("caustica.rt.fg", "frame-generation.enabled", false);
@@ -701,7 +719,7 @@ public final class CausticaConfig {
             public static final FloatSetting MIN_EV =
                     finiteFloat("caustica.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 4.0f);
+                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 3.0f);
             public static final FloatSetting ADAPT_UP =
                     exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.12f);
             public static final FloatSetting ADAPT_DOWN =

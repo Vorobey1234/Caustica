@@ -254,23 +254,56 @@ public final class RtEntityTextures {
         long handle = 0L;
         try {
             PreparedRenderType prepared = renderType.prepare();
-            GpuTextureView chosen = null;
-            GpuTextureView firstNonAux = null;
-            for (PreparedRenderType.Texture t : prepared.textures()) {
-                String name = t.name();
-                if ("Sampler0".equals(name)) {
-                    chosen = t.textureView();
-                    break;
+            if (prepared != null) {
+                GpuTextureView chosen = null;
+                GpuTextureView firstNonAux = null;
+                for (PreparedRenderType.Texture t : prepared.textures()) {
+                    String name = t.name();
+                    if ("Sampler0".equals(name)) {
+                        chosen = t.textureView();
+                        break;
+                    }
+                    if (firstNonAux == null && !"Sampler1".equals(name) && !"Sampler2".equals(name)) {
+                        firstNonAux = t.textureView();
+                    }
                 }
-                if (firstNonAux == null && !"Sampler1".equals(name) && !"Sampler2".equals(name)) {
-                    firstNonAux = t.textureView();
+                if (chosen == null) {
+                    chosen = firstNonAux;
+                }
+                if (chosen != null) {
+                    handle = vkImageView(chosen);
                 }
             }
-            if (chosen == null) {
-                chosen = firstNonAux;
-            }
-            if (chosen != null) {
-                handle = vkImageView(chosen);
+            // Fallback: resolve from RenderSetup textures directly if prepare() didn't work
+            // (common for custom resource pack models with non-standard RenderTypes).
+            if (handle == 0L) {
+                try {
+                    Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+                    if (setup != null) {
+                        Map<String, ?> textures = ((RenderSetupAccessor) setup).caustica$textures();
+                        if (textures != null) {
+                            Object binding = textures.get("Sampler0");
+                            if (binding == null && !textures.isEmpty()) {
+                                binding = textures.values().iterator().next();
+                            }
+                            if (binding != null) {
+                                if (locationMethod == null) {
+                                    locationMethod = binding.getClass().getMethod("location");
+                                    locationMethod.setAccessible(true);
+                                }
+                                Identifier loc = (Identifier) locationMethod.invoke(binding);
+                                if (loc != null) {
+                                    var tex = Minecraft.getInstance().getTextureManager().getTexture(loc);
+                                    if (tex != null && tex.getTextureView() != null) {
+                                        handle = vkImageView(tex.getTextureView());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable t2) {
+                    // Fallback failed silently
+                }
             }
         } catch (Throwable t) {
             if (!loggedFailure) {

@@ -35,7 +35,10 @@ public final class RtLabPbr {
     public static Specular decodeSpec(float red, float green, float blue, float alpha,
                                       float albedoR, float albedoG, float albedoB) {
         float smoothness = clamp01(red);
-        float roughness = (1.0f - smoothness) * (1.0f - smoothness);
+        // Keep perceptual roughness in the material payload. The GGX implementation converts it to
+        // alpha by squaring once; squaring here as well made alpha=(1-smoothness)^4 and turned ordinary
+        // materials such as wood into near-perfect mirrors.
+        float roughness = 1.0f - smoothness;
         float g = clamp01(green) * 255.0f;
         float metalness;
         float f0r;

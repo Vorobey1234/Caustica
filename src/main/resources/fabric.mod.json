@@ -3,7 +3,7 @@
 	"id": "caustica",
 	"version": "${version}",
 	"name": "Caustica",
-	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
+	"description": "Hardware-ray-traced renderer for the Minecraft Vulkan backend. Works on AMD and NVIDIA GPUs.",
 	"authors": [
 		"i"
 	],

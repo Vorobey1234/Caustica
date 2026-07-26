@@ -25,7 +25,6 @@ import java.util.List;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
-import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 
@@ -76,18 +75,20 @@ public final class RtWorldOverlay {
      * target. Called after the RT world composite and before the vanilla hand/screen-effects/GUI path can draw
      * more UI layers into that same target.
      */
-    public void compositeIntoUiOverlay(RenderTarget main, RtGpuExecutor.GraphicsUse graphicsUse) {
-        if (graphicsUse == null || failed || main == null || main.getColorTexture() == null || !RtUiOverlay.enabled()) {
-            return;
-        }
-        RtContext ctx = RtContext.currentOrNull();
-        if (ctx == null) {
-            return;
-        }
+    public void compositeIntoUiOverlay(RenderTarget main) {
+        long frame = RtComposite.frameCounter();
+        framePool.beginFrame(frame);
         try {
+            if (failed || main == null || main.getColorTexture() == null || !RtUiOverlay.enabled()) {
+                return;
+            }
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx == null) {
+                return;
+            }
             List<RtOverlayFeature> ready = new ArrayList<>(features.size());
             for (RtOverlayFeature f : features) {
-                if (f.prepare(ctx, framePool, graphicsUse, main.width, main.height)) {
+                if (f.prepare(ctx, framePool, main.width, main.height)) {
                     ready.add(f);
                 }
             }
@@ -105,7 +106,7 @@ public final class RtWorldOverlay {
             failed = true;
             CausticaMod.LOGGER.error("World overlay failed; disabling for this session", t);
         } finally {
-            framePool.endFrame(ctx, graphicsUse);
+            framePool.endFrame(frame);
         }
     }
 

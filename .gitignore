@@ -6,6 +6,8 @@ native/ngx_shim/build/
 run/
 out/
 *.log
+/logs/
+/log.txt
 *.class
 third_party/
 bin/

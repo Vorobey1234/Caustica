@@ -1,5 +1,30 @@
 # Developer Guide
 
+## Common prerequisites
+
+- JDK 25. On Windows, `JAVA_HOME` must point to the JDK directory, not to `bin\java.exe`.
+- Vulkan SDK tools on `PATH`: `slangc`, `glslangValidator`, and `spirv-val`.
+
+### Windows build without DLSS/NGX
+
+The simplest option is the checked-in script:
+
+```powershell
+.\build-no-dlss.ps1
+```
+
+The repository contains the redistributable OIDN and NRD runtimes, so only NGX needs to be disabled:
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Java\jdk-25.0.3"
+$env:Path = "$env:JAVA_HOME\bin;$env:VULKAN_SDK\Bin;$env:Path"
+.\gradlew.bat --stop
+.\gradlew.bat clean assemble -PnoNgx
+```
+
+The mod JAR is written to `build\libs\caustica-0.1.0.jar`. The built-in temporal/spatial
+denoiser, OIDN, NRD, puddles, and volumetric rain fog do not require the DLSS SDK.
+
 ## Windows
 
 1. Install the Vulkan SDK from <https://vulkan.lunarg.com/sdk/home>.

@@ -12,7 +12,7 @@ final class RtLabPbrTest {
         RtLabPbr.Specular value = RtLabPbr.decodeSpec(
                 0.25f, 0.04f, 64.0f / 255.0f, 1.0f,
                 0.7f, 0.6f, 0.5f);
-        assertEquals(0.5625f, value.roughness(), EPS);
+        assertEquals(0.75f, value.roughness(), EPS);
         assertEquals(0.0f, value.metalness(), EPS);
         assertEquals(0.04f, value.f0r(), EPS);
         assertEquals(0.0f, value.emission(), EPS);
@@ -24,7 +24,7 @@ final class RtLabPbrTest {
         RtLabPbr.Specular value = RtLabPbr.decodeSpec(
                 0.5f, 1.0f, 1.0f, 127.0f / 255.0f,
                 0.7f, 0.6f, 0.5f);
-        assertEquals(0.25f, value.roughness(), EPS);
+        assertEquals(0.5f, value.roughness(), EPS);
         assertEquals(1.0f, value.metalness(), EPS);
         assertEquals(0.7f, value.f0r(), EPS);
         assertEquals(0.6f, value.f0g(), EPS);
@@ -43,5 +43,13 @@ final class RtLabPbrTest {
         assertEquals(0.944f, value.f0r(), 0.002f);
         assertEquals(0.776f, value.f0g(), 0.002f);
         assertEquals(0.373f, value.f0b(), 0.002f);
+    }
+
+    @Test
+    void keepsLabPbrRoughnessPerceptualForGgx() {
+        RtLabPbr.Specular value = RtLabPbr.decodeSpec(
+                200.0f / 255.0f, 15.0f / 255.0f, 0.0f, 1.0f,
+                0.5f, 0.4f, 0.3f);
+        assertEquals(55.0f / 255.0f, value.roughness(), EPS);
     }
 }

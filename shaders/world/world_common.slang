@@ -10,21 +10,13 @@ module world_common;
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
 
 // Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
-// hit shaders or used for raygen control flow — every 64-bit device address lives here for exactly that
-// reason, rather than behind the worldPushAddr indirection. tableAddr/entityTableAddr/materialTableAddr
-// are read in world.rahit/world.rchit, which never load WorldPush at all; the light-buffer addresses are
-// only read in world.rgen, which loads WorldPush anyway, but keeping every Addr in one place means there
-// is exactly one struct to check when adding a new device buffer, instead of two.
+// hit shaders or used for raygen control flow.
 public struct WorldPushConstants {
     public uint64_t worldPushAddr;
     public uint64_t tableAddr;
     public uint64_t entityTableAddr;
+    public uint64_t dhTableAddr;
     public uint64_t materialTableAddr;
-    public uint64_t lightBufAddr;        // RIS emitter-NEE global light buffer (0 = none published)
-    public uint64_t lightAliasAddr;      // power-weighted O(1) alias table (0 = uniform fallback)
-    public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
-    public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
-    public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
     public uint frameIndex;
     public uint debugView;
 };
@@ -35,17 +27,29 @@ public struct BreakEntry {
     public int4 posSlot;
 };
 
+// Compact analytic local light used for placed emissive blocks, held items and dropped items.
+// positionRadius.xyz is in the same rebased world space as terrain/entity geometry; w is the smooth
+// cutoff radius. radiance.rgb is linear light colour and radiance.w is radiant intensity. Keeping the
+// list in WorldPush avoids another descriptor/buffer lifetime and makes the small many-light set cheap
+// to update every frame.
+public struct PointLight {
+    public float4 positionRadius;
+    public float4 radiance;
+};
+
 // Per-frame world data, read through a 64-bit device address. WorldPushData.java is generated from this
 // reflected type, including its serializer, byte size, vector/matrix types, and fixed-array capacities.
 public struct WorldPush {
     public float4x4 invViewProj;
     public float3   camOffset;
+    public uint64_t tableAddr;        // section table
     public uint     frameIndex;
     public float4x4 prevViewProj;
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint     flags;            // bit0 submerged, bit4 waves (bit1 was PBR-toggle, now unconditional)
+    public uint64_t entityTableAddr;  // entity geometry table
+    public uint     flags;            // bit0 camera submerged, bit1 PBR BRDF, bit4 water waves
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)
@@ -54,81 +58,24 @@ public struct WorldPush {
     public float4   celestial;        // xyz celestial rotation axis, w star angle (rad)
     public float4   sunUv;            // vanilla sun sprite atlas rect (u0,v0,u1,v1)
     public float4   moonUv;           // vanilla current-moon-phase sprite atlas rect
+    public float4   weather;          // x rain, y thunder, z overcast, w animation time (s)
+    public float4   cloudParams;      // x biome temperature, y moisture, zw absolute terrain origin
     public float4   waterParams;      // xyz camera-biome water tint, w wave time (s)
-    public float4   waterAnchor;      // xy world-stable wave-domain anchor
+    public float4   waterAnchor;      // xy wave anchor, z DH transition radius, w cloud frame delta (s)
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
-    public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
-    public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
-    public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
-    public uint     lightCount;       // packed Light records in pc.lightBufAddr
-    public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
+    public uint     pointLightCount;
+    public PointLight pointLights[24]; // nearest/strongest local emitters; unused entries are zeroed by serializer
 };
-
-// 32-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
-// uses three unsigned 10-bit coordinates; the geometric normal is reconstructed from the half axes.
-//
-// 32 divides the 64-byte cache line, so a record never straddles one. At the previous 48 bytes about
-// half of them did, costing two transactions apiece — and RIS fetches these at random indices, M per
-// shading vertex, so that is the layout's whole purpose. float3 forces 16-byte struct alignment and 32
-// is a multiple of it, so this lands with no tail padding.
-//
-// The rectangle area is derived rather than stored: the rect spans 2U x 2V, so area = 4*|U x V|, which
-// is exactly what the collector used to write (halfU = 0.5*(aHi-aLo)*e01 and rectArea =
-// |e01 x e03|*(aHi-aLo)*(bHi-bLo)). lightGeometricNormal already needs that cross product, so the
-// freed lane costs one length() the compiler shares with the normalize.
-public struct Light {
-    public float3 pos;      // rebased world centre, f32 (the RIS target divides by distance to it)
-    public uint   le;       // bitcast R11G11B10 radiance
-    public uint   halfUxy;  // half2(U.x, U.y)
-    public uint   halfUzVx; // half2(U.z, V.x)
-    public uint   halfVyz;  // half2(V.y, V.z)
-    public uint   section;  // 10:10:10 grid-relative section coord + bit 30 normal-flip
-};
-
-// Eight-byte Vose alias-table column. PDFs are reconstructed from the selected Light.
-public struct LightAlias {
-    public uint  aliasIndex;
-    public float accept;
-};
-
-// Dense light grid cell entry. Empty coordinates have spanCount=0; populated section cells point into
-// an immutable list of weighted section light ranges built and published alongside this grid.
-public struct LightGridCell {
-    public uint spanOffset;
-    public uint spanCount;
-    public float invWeightSum;
-};
-
-// One 16-byte Vose alias column for a cell's section distribution. The two light counts are uint16s.
-public struct LightGridSpan {
-    public uint firstLight;
-    public uint aliasFirstLight;
-    public uint packedLightCounts; // low16 self, high16 alias
-    public float accept;
-};
-
-// TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
-public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
-
-// Largest finite half. The payload's half3 lanes carry HDR values (sky radiance most of all), so
-// producers clamp to this instead of letting the conversion round up to +inf.
-public static const float HALF_MAX = 65504.0;
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
-//
-// The three-component lanes are half3: they cost 6 bytes instead of 12, and payload storage is reserved
-// per trace call site, so every byte here is paid twice per radiance trace (once for TraceRay, once for
-// Invoke) and is preserved across the SER reorder. hitT stays f32 — it reaches 10000 blocks and the hit
-// position is reconstructed from it, where half's ~4-block spacing at that magnitude would be visible.
 public struct Payload {
-    // Sky radiance on a miss, so this carries HDR values well above 1; half tops out at 65504.
-    public half3  albedo;      // hit: block albedo. miss: sky radiance.
-    public half3  normal;      // hit: geometric normal, viewer-oriented.
+    public float3 albedo;      // hit: block albedo. miss: sky radiance.
+    public float3 normal;      // hit: geometric normal, viewer-oriented.
     public float  hitT;        // >= 0 on hit, < 0 on miss.
-    public half3  motionPrev;  // per-vertex world displacement since last frame.
-    public half3  f0;          // specular F0.
+    public float3 motionPrev;  // per-vertex world displacement since last frame.
+    public float3 f0;          // specular F0.
     public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
@@ -137,9 +84,6 @@ public struct Payload {
 };
 
 public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
-// Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
-// RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
-public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
 // Set by world.rchit on a MATERIAL_WATER hit: true when the incoming ray travels against the prim's
 // outward face normal (entering the water volume), false when it exits (water -> air). Bit 2
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
@@ -147,16 +91,47 @@ public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
+// Animated primary geometry must never be treated as a stationary raw-accumulation surface.
+public static const uint PAYLOAD_DYNAMIC_SURFACE = 1u << 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;
 public static const uint EMISSION_SOURCE_UNIFORM = 1u;
 public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
 public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
+public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
 public static const uint PAYLOAD_MATERIAL_MASK = 3u;
 public static const uint MATERIAL_OPAQUE = 0u;
 public static const uint MATERIAL_WATER = 1u;
 public static const uint MATERIAL_PARTICLE = 2u;
 public static const uint MATERIAL_GLASS = 3u;
+
+// Coarse Distant Horizons primitive classification stored in TerrainPrim.tint.w. This is separate
+// from the payload material enum because the importer still needs to distinguish source geometry
+// before closest-hit has populated the payload.
+public static const uint DH_SURFACE_SOLID = 0u;
+public static const uint DH_SURFACE_WATER = 1u;
+public static const uint DH_SURFACE_GLASS = 2u;
+public static const uint DH_SURFACE_EMISSIVE = 3u;
+public static const uint DH_SURFACE_EMISSIVE_GLASS = 4u;
+
+// EDhApiBlockMaterial mini-material stored in TerrainPrim.flags for DH geometry. These coarse
+// categories survive DH's LOD reduction even though exact block-state/sprite identity does not.
+public static const uint DH_MATERIAL_UNKNOWN = 0u;
+public static const uint DH_MATERIAL_LEAVES = 1u;
+public static const uint DH_MATERIAL_STONE = 2u;
+public static const uint DH_MATERIAL_WOOD = 3u;
+public static const uint DH_MATERIAL_METAL = 4u;
+public static const uint DH_MATERIAL_DIRT = 5u;
+public static const uint DH_MATERIAL_LAVA = 6u;
+public static const uint DH_MATERIAL_DEEPSLATE = 7u;
+public static const uint DH_MATERIAL_SNOW = 8u;
+public static const uint DH_MATERIAL_SAND = 9u;
+public static const uint DH_MATERIAL_TERRACOTTA = 10u;
+public static const uint DH_MATERIAL_NETHER_STONE = 11u;
+public static const uint DH_MATERIAL_WATER = 12u;
+public static const uint DH_MATERIAL_GRASS = 13u;
+public static const uint DH_MATERIAL_AIR = 14u;
+public static const uint DH_MATERIAL_ILLUMINATED = 15u;
 
 // Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
@@ -196,14 +171,11 @@ public struct MaterialHeader {
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
 public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
-// Final HDR emission strength (EMISSIVE_STRENGTH baseline * any JSON override multiplier), baked in Java
-// at material-compile time (RtMaterialRegistry) and packed here as a 16-bit fraction of the max — every
-// emissive material carries a value (0 for non-emissive), not just resource-pack-overridden ones, so the
-// full features word's spare 16 bits (8..23) go to it instead of the 8 bits the old override-only field used.
 public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
-public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 65535u;
-public static const float MATERIAL_MAX_EMISSION_STRENGTH = 32.0;
+public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
+public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;
 public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
 public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 
@@ -230,6 +202,7 @@ public struct EntityGeom {
 // TLAS instance-custom-index encoding + terrain geometry buckets (shared by rahit/rchit).
 public static const uint ENTITY_BIT = 0x800000u;
 public static const uint PARTICLE_BIT = 0x400000u; // particles share the entity cutout path
+public static const uint DH_INSTANCE_KIND = ENTITY_BIT | PARTICLE_BIT;
 public static const uint IDX_MASK = 0x3FFFFFu;     // low 22 bits = geom-table index
 public static const uint BUCKET_CUTOUT = 1u;
 public static const uint BUCKET_TRANSLUCENT = 2u;

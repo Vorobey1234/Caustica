@@ -1,0 +1,136 @@
+#version 460
+
+// Reconstructs a sparse checkerboard/interlaced ray-tracing frame without any bilinear filtering.
+// One invocation owns one non-overlapping sampling tile. Half-rate uses a true checkerboard. Lower
+// rates keep one sparse sample per tile. A per-pixel validity image prevents the resolver from
+// overwriting already traced native pixels, so jitter fills the real full-resolution image over time
+// instead of repeatedly expanding a low-resolution tile image.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform image2D colorImage;
+layout(binding = 1, rgba16f) uniform image2D normalImage;
+layout(binding = 2, rgba16f) uniform image2D albedoImage;
+layout(binding = 3, r32f)    uniform image2D depthImage;
+layout(binding = 4, rg16f)   uniform image2D motionImage;
+layout(binding = 5, rgba16f) uniform image2D specAlbedoImage;
+layout(binding = 6, rg16f)   uniform image2D specMotionImage;
+layout(binding = 7, r32ui)   uniform uimage2D validityImage;
+
+layout(push_constant) uniform Push {
+    uint width;
+    uint height;
+    uint divisor;
+    uint jitterEnabled;
+    uint frameIndex;
+} pc;
+
+ivec2 tileSizeFor(uint divisor) {
+    if (divisor <= 1u) return ivec2(1, 1);
+    if (divisor == 2u || divisor == 4u) return ivec2(2, 2);
+    if (divisor == 8u) return ivec2(4, 2);
+    return ivec2(4, 4);
+}
+
+ivec2 phaseFromIndex(uint divisor, uint index) {
+    if (divisor <= 1u) return ivec2(0, 0);
+    if (divisor == 4u) return ivec2(int(index & 1u), int((index >> 1u) & 1u));
+    if (divisor == 8u) return ivec2(int(index & 3u), int((index >> 2u) & 1u));
+    return ivec2(int(index & 3u), int((index >> 2u) & 3u));
+}
+
+uint stablePhaseIndex(uint divisor, ivec2 tileCoord) {
+    uint tx = uint(max(tileCoord.x, 0));
+    uint ty = uint(max(tileCoord.y, 0));
+    if (divisor <= 1u) return 0u;
+    if (divisor == 4u) {
+        return (((tx ^ ty) & 1u) == 0u) ? 0u : 3u;
+    }
+    if (divisor == 8u) {
+        return ((tx * 5u) ^ (ty * 3u)) & 7u;
+    }
+    return ((tx * 5u) + (ty * 7u)) & 15u;
+}
+
+ivec2 phaseFor(uint divisor, ivec2 tileCoord) {
+    uint idx = stablePhaseIndex(divisor, tileCoord);
+    if (pc.jitterEnabled != 0u) {
+        idx = (idx + pc.frameIndex) & (divisor - 1u);
+    }
+    return phaseFromIndex(divisor, idx);
+}
+
+void main() {
+    ivec2 tile = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tileSize = tileSizeFor(pc.divisor);
+    ivec2 origin = tile * tileSize;
+    ivec2 size = ivec2(int(pc.width), int(pc.height));
+    if (any(greaterThanEqual(origin, size))) return;
+
+    if (pc.divisor == 2u) {
+        // Two real checkerboard samples exist in every 2x2 tile. Mark only those exact native pixels
+        // valid. A missing pixel is reconstructed only until its own opposite phase has actually run;
+        // after that, its previous native ray result is retained instead of being overwritten by a copy.
+        for (int x = 0; x < 2; x++) {
+            int pixelX = origin.x + x;
+            if (pixelX >= size.x) continue;
+            uint checkerParity = uint(pixelX) & 1u;
+            if (pc.jitterEnabled != 0u) {
+                checkerParity ^= (pc.frameIndex & 1u);
+            }
+            int selectedY = origin.y + int(checkerParity);
+            ivec2 samplePixel = ivec2(pixelX, min(selectedY, size.y - 1));
+            imageStore(validityImage, samplePixel, uvec4(1u));
+
+            vec4 color = imageLoad(colorImage, samplePixel);
+            vec4 normal = imageLoad(normalImage, samplePixel);
+            vec4 albedo = imageLoad(albedoImage, samplePixel);
+            float depth = imageLoad(depthImage, samplePixel).r;
+            vec2 motion = imageLoad(motionImage, samplePixel).rg;
+            vec4 specAlbedo = imageLoad(specAlbedoImage, samplePixel);
+            vec2 specMotion = imageLoad(specMotionImage, samplePixel).rg;
+            for (int y = 0; y < 2; y++) {
+                ivec2 pixel = origin + ivec2(x, y);
+                if (pixel.y >= size.y || all(equal(pixel, samplePixel))) continue;
+                if (imageLoad(validityImage, pixel).r != 0u) continue;
+                imageStore(colorImage, pixel, color);
+                imageStore(normalImage, pixel, normal);
+                imageStore(albedoImage, pixel, albedo);
+                imageStore(depthImage, pixel, vec4(depth));
+                imageStore(motionImage, pixel, vec4(motion, 0.0, 0.0));
+                imageStore(specAlbedoImage, pixel, specAlbedo);
+                imageStore(specMotionImage, pixel, vec4(specMotion, 0.0, 0.0));
+            }
+        }
+        return;
+    }
+
+    // Partial edge tiles clamp their selected phase back into that same tile.
+    ivec2 samplePixel = min(origin + phaseFor(pc.divisor, tile), size - 1);
+
+    imageStore(validityImage, samplePixel, uvec4(1u));
+    vec4 color = imageLoad(colorImage, samplePixel);
+    vec4 normal = imageLoad(normalImage, samplePixel);
+    vec4 albedo = imageLoad(albedoImage, samplePixel);
+    float depth = imageLoad(depthImage, samplePixel).r;
+    vec2 motion = imageLoad(motionImage, samplePixel).rg;
+    vec4 specAlbedo = imageLoad(specAlbedoImage, samplePixel);
+    vec2 specMotion = imageLoad(specMotionImage, samplePixel).rg;
+
+    for (int y = 0; y < tileSize.y; y++) {
+        for (int x = 0; x < tileSize.x; x++) {
+            ivec2 pixel = origin + ivec2(x, y);
+            if (any(greaterThanEqual(pixel, size)) || all(equal(pixel, samplePixel))) continue;
+            // Preserve a pixel once its own checkerboard phase has produced a real ray. This is the key
+            // difference from nearest-neighbour tile expansion: after divisor frames (with jitter on),
+            // every pixel contains native-resolution history and no block-upscaled cells remain.
+            if (imageLoad(validityImage, pixel).r != 0u) continue;
+            imageStore(colorImage, pixel, color);
+            imageStore(normalImage, pixel, normal);
+            imageStore(albedoImage, pixel, albedo);
+            imageStore(depthImage, pixel, vec4(depth));
+            imageStore(motionImage, pixel, vec4(motion, 0.0, 0.0));
+            imageStore(specAlbedoImage, pixel, specAlbedo);
+            imageStore(specMotionImage, pixel, vec4(specMotion, 0.0, 0.0));
+        }
+    }
+}

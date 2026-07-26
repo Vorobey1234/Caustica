@@ -31,6 +31,7 @@ public final class RtBlockMaterials {
     public static final RtBlockMaterials INSTANCE = new RtBlockMaterials();
 
     // Entry.features uses the shared MaterialHeader feature bits (RtMaterialRegistry.FEATURE_*).
+    // FEATURE_OVERRIDE_EMISSION here means "override mask baked into surface1.a for this candidate".
 
     private static final int DEFAULT_PAGE_SIZE = 2048;
     private static final int MAX_PAGE_SIZE = 8192;
@@ -54,7 +55,8 @@ public final class RtBlockMaterials {
     public record Entry(int features, int pageIndex, int maxLod,
                         float materialU, float materialV, float materialDu, float materialDv,
                         float albedoU, float albedoV, float albedoInvDu, float albedoInvDv,
-                        RtMaterialDesc.EmissionSummary emissionSummary, RtEmissionGrid emissionGrid) {
+                        RtMaterialDesc.EmissionSummary emissionSummary,
+                        RtMaterialDesc.EmissionSummary overrideEmissionSummary) {
     }
 
     private record Page(RtMaterialPageTexture surface0, RtMaterialPageTexture normalAo,
@@ -79,7 +81,7 @@ public final class RtBlockMaterials {
         int x;
         int y;
         RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
-        RtEmissionGrid emissionGrid;
+        RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
 
         Candidate(TextureAtlasSprite sprite, Identifier name, Identifier albedoLocation, int features,
                   Identifier specLocation, Identifier normalLocation, int width, int height) {
@@ -144,6 +146,7 @@ public final class RtBlockMaterials {
         int specCount = 0;
         int normalCount = 0;
         int heuristicCount = 0;
+        int overrideMaskCount = 0;
         int largest = 1 + 2 * GUTTER;
         for (TextureAtlasSprite sprite : sprites) {
             if (sprite == null) continue;
@@ -160,12 +163,14 @@ public final class RtBlockMaterials {
                 normalCount++;
             }
             // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
-            // sprites proven to occur on an emitting block state. A resource-pack emission.strength
-            // override only scales this once resolved (RtMaterialOverrides.Rule.apply) — it never
-            // changes which sprites get a mask compiled here.
+            // sprites proven to occur on an emitting block state.
             if ((features & RtMaterialRegistry.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
                 features |= RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION;
                 heuristicCount++;
+            }
+            if (overrides.requestsEmissionMask(sprite)) {
+                features |= RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION;
+                overrideMaskCount++;
             }
             if (features != 0) {
                 int width = sprite.contents().width();
@@ -189,6 +194,7 @@ public final class RtBlockMaterials {
                 authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
                 if ((features & RtMaterialRegistry.FEATURE_SPEC) != 0) specCount++;
                 if ((features & RtMaterialRegistry.FEATURE_NORMAL) != 0) normalCount++;
+                if ((features & RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION) != 0) overrideMaskCount++;
             } catch (Throwable t) {
                 warnOnce("RT entity material albedo load failed for " + albedo, t);
             }
@@ -242,7 +248,7 @@ public final class RtBlockMaterials {
             try {
                 Decoded decoded = decode(candidate);
                 candidate.emissionSummary = decoded.emissionSummary();
-                candidate.emissionGrid = decoded.emissionGrid();
+                candidate.overrideEmissionSummary = decoded.overrideEmissionSummary();
                 pagePixels[candidate.page].write(candidate, decoded.levels());
             } catch (Throwable t) {
                 warnOnce("RT canonical material decode failed for " + candidate.name, t);
@@ -264,7 +270,7 @@ public final class RtBlockMaterials {
         float fallbackUv = GUTTER / (float) pageSize;
         fallback = new Entry(0, 0, 0, fallbackUv, fallbackUv,
                 1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1,
-                RtMaterialDesc.EmissionSummary.NONE, null);
+                RtMaterialDesc.EmissionSummary.NONE, RtMaterialDesc.EmissionSummary.NONE);
         for (TextureAtlasSprite sprite : sprites) {
             if (sprite != null) entries.put(sprite, fallbackFor(sprite));
         }
@@ -278,7 +284,7 @@ public final class RtBlockMaterials {
                     candidate.blockSprite() ? candidate.sprite.getV0() : 0.0f,
                     candidate.blockSprite() ? inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()) : 1.0f,
                     candidate.blockSprite() ? inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()) : 1.0f,
-                    candidate.emissionSummary, candidate.emissionGrid);
+                    candidate.emissionSummary, candidate.overrideEmissionSummary);
             if (candidate.blockSprite()) entries.put(candidate.sprite, entry);
             else resourceEntries.put(candidate.name, entry);
         }
@@ -289,16 +295,16 @@ public final class RtBlockMaterials {
             bytesPerBundle += (long) w * w * 4L;
             w = Math.max(1, w / 2);
         }
-        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
-                sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount,
+        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, overrideMasks={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
+                sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount, overrideMaskCount,
                 pages.size(), pageSize, pageSize, MAX_VALID_LOD,
                 String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
     }
 
-    public void bindPages(RtPipeline pipeline, long sampler) {
+    public void bindPages(RtPipeline pipeline, long sampler, long normalSampler) {
         for (Page page : pages) {
             pipeline.setMaterialPage(page.index(), page.surface0().view(), page.normalAo().view(),
-                    page.surface1().view(), sampler);
+                    page.surface1().view(), sampler, normalSampler);
         }
     }
 
@@ -322,26 +328,13 @@ public final class RtBlockMaterials {
         return new Entry(0, fallback.pageIndex(), 0,
                 fallback.materialU, fallback.materialV, fallback.materialDu, fallback.materialDv,
                 sprite.getU0(), sprite.getV0(), inverseExtent(sprite.getU1() - sprite.getU0()),
-                inverseExtent(sprite.getV1() - sprite.getV0()), RtMaterialDesc.EmissionSummary.NONE, null);
+                inverseExtent(sprite.getV1() - sprite.getV0()), RtMaterialDesc.EmissionSummary.NONE,
+                RtMaterialDesc.EmissionSummary.NONE);
     }
 
     private record Decoded(List<RtMaterialTextureData.Level> levels,
-                           RtMaterialDesc.EmissionSummary emissionSummary, RtEmissionGrid emissionGrid) {
-    }
-
-    /** Reduce a per-texel emission mask to the light collector's summary grid (premultiplied by albedo). */
-    private static RtEmissionGrid emissionGrid(float[] linearAlbedo, float[] mask, int width, int height) {
-        RtEmissionGrid.Builder builder = new RtEmissionGrid.Builder(width, height);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int pixel = y * width + x;
-                float weight = Math.max(0.0f, Math.min(1.0f, mask[pixel]));
-                int i = pixel * 4;
-                builder.add(x, y, linearAlbedo[i] * weight, linearAlbedo[i + 1] * weight,
-                        linearAlbedo[i + 2] * weight, weight);
-            }
-        }
-        return builder.build();
+                           RtMaterialDesc.EmissionSummary emissionSummary,
+                           RtMaterialDesc.EmissionSummary overrideEmissionSummary) {
     }
 
     private static Decoded decode(Candidate candidate) throws Exception {
@@ -364,7 +357,8 @@ public final class RtBlockMaterials {
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
                     int i = (y * width + x) * 4;
-                    int albedoPixel = albedo != null ? albedo.getPixel(x, y) : -1;
+                    int albedoPixel = albedo != null
+                            ? sample(albedo, x, y, width, height, candidate.blockSprite()) : -1;
                     float ar = RtMaterialTextureData.srgbToLinear(ARGB.red(albedoPixel));
                     float ag = RtMaterialTextureData.srgbToLinear(ARGB.green(albedoPixel));
                     float ab = RtMaterialTextureData.srgbToLinear(ARGB.blue(albedoPixel));
@@ -411,24 +405,25 @@ public final class RtBlockMaterials {
                 }
             }
             RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
-            RtEmissionGrid grid = null;
             if (spec != null) {
                 emissionSummary = RtEmissionHeuristic.summarize(linearAlbedo, authoredEmission);
-                grid = emissionGrid(linearAlbedo, authoredEmission, width, height);
             }
+            RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
             boolean heuristic = (candidate.features & RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION) != 0;
-            if (heuristic) {
+            boolean overrideMask = (candidate.features & RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION) != 0;
+            if (heuristic || overrideMask) {
                 RtEmissionHeuristic.Result emission = RtEmissionHeuristic.compile(linearAlbedo);
                 float[] mask = emission.mask();
                 for (int pixel = 0; pixel < mask.length; pixel++) {
-                    surface0[pixel * 4 + 2] = mask[pixel];
+                    if (heuristic) surface0[pixel * 4 + 2] = mask[pixel];
+                    if (overrideMask) surface1[pixel * 4 + 3] = mask[pixel];
                 }
-                emissionSummary = emission.summary();
-                grid = emissionGrid(linearAlbedo, mask, width, height);
+                if (heuristic) emissionSummary = emission.summary();
+                if (overrideMask) overrideEmissionSummary = emission.summary();
             }
             int maxLod = maxLodFor(width, height);
             return new Decoded(RtMaterialTextureData.mipChain(new RtMaterialTextureData.Level(width, height,
-                    surface0, normalAo, surface1), maxLod), emissionSummary, grid);
+                    surface0, normalAo, surface1), maxLod), emissionSummary, overrideEmissionSummary);
         } finally {
             if (spec != null) spec.close();
             if (normal != null) normal.close();
@@ -532,16 +527,15 @@ public final class RtBlockMaterials {
             result.merge(albedo, spec ? RtMaterialRegistry.FEATURE_SPEC
                     : RtMaterialRegistry.FEATURE_NORMAL, (a, b) -> a | b);
         }
-        // Also register any non-block sprite a rule targets, even lacking _s/_n, so overrides
-        // (roughness/metalness/model, or an emission.strength multiplier once some other source
-        // supplies emission) have a compiled Candidate/Entry to apply to.
         for (RtMaterialOverrides.Rule rule : overrides.rules()) {
             if (rule.block() != null || blockNames.contains(rule.sprite())) {
                 continue;
             }
             Identifier albedo = textureLocation(rule.sprite());
             if (resourceExists(albedo)) {
-                result.merge(albedo, 0, (a, b) -> a | b);
+                int feature = rule.emissionStrength() != null && rule.emissionStrength() > 0.0f
+                        ? RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION : 0;
+                result.merge(albedo, feature, (a, b) -> a | b);
             }
         }
         return result;
@@ -587,10 +581,26 @@ public final class RtBlockMaterials {
     }
 
     private static int sample(NativeImage image, int x, int y, int width, int height, boolean firstFrameOnly) {
-        int sampledHeight = firstFrameOnly ? Math.min(image.getHeight(), image.getWidth()) : image.getHeight();
+        int sampledHeight = firstFrameOnly
+                ? sampledFrameHeight(image.getWidth(), image.getHeight(), width, height)
+                : image.getHeight();
         int sx = Math.min(image.getWidth() - 1, x * image.getWidth() / width);
         int sy = Math.min(sampledHeight - 1, y * sampledHeight / height);
         return image.getPixel(sx, sy);
+    }
+
+    /**
+     * Material maps for animated sprites are vertical frame sheets. Infer the first
+     * frame's source height from the logical sprite aspect ratio instead of assuming
+     * every frame is square; that assumption mixed adjacent frames on rectangular
+     * textures and made only part of the mapped surface appear correct.
+     */
+    static int sampledFrameHeight(int imageWidth, int imageHeight, int spriteWidth, int spriteHeight) {
+        if (imageWidth <= 0 || imageHeight <= 0 || spriteWidth <= 0 || spriteHeight <= 0) {
+            throw new IllegalArgumentException("Texture and sprite dimensions must be positive");
+        }
+        long scaled = Math.round((double) spriteHeight * imageWidth / spriteWidth);
+        return (int) Math.clamp(scaled, 1L, imageHeight);
     }
 
     static float inverseExtent(float extent) {

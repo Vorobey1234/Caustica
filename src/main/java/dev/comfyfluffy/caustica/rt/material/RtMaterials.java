@@ -56,6 +56,37 @@ public final class RtMaterials {
             Blocks.POLISHED_DEEPSLATE, Blocks.POLISHED_BLACKSTONE,
             Blocks.PRISMARINE, Blocks.PRISMARINE_BRICKS, Blocks.DARK_PRISMARINE);
 
+    /**
+     * Blocks that are genuinely thin-dielectric transmissive surfaces (stained glass, ice, etc.).
+     * Used to gate {@code MODEL_GLASS} selection: a quad reporting {@code ChunkSectionLayer.TRANSLUCENT}
+     * is only treated as a thin dielectric when the block itself is one of these. Resource packs that
+     * mislabel cutout foliage or solid stairs as TRANSLUCENT no longer cause those blocks to render as
+     * glossy glass — they fall back to the opaque/cutout material path with their authored roughness.
+     */
+    private static final Set<Block> THIN_DIELECTRIC = thinDielectricSet();
+
+    private static Set<Block> thinDielectricSet() {
+        Set<Block> set = new java.util.HashSet<>();
+        set.add(Blocks.GLASS);
+        set.add(Blocks.GLASS_PANE);
+        set.add(Blocks.TINTED_GLASS);
+        set.add(Blocks.ICE);
+        set.add(Blocks.BLUE_ICE);
+        set.add(Blocks.PACKED_ICE);
+        set.add(Blocks.FROSTED_ICE);
+        set.add(Blocks.SLIME_BLOCK);
+        set.add(Blocks.HONEY_BLOCK);
+        // Stained glass and stained glass panes are exposed as ColorCollections in this MC version.
+        Blocks.STAINED_GLASS.forEach(set::add);
+        Blocks.STAINED_GLASS_PANE.forEach(set::add);
+        return java.util.Collections.unmodifiableSet(set);
+    }
+
+    /** True if this block is a genuine thin-dielectric (glass/ice/etc.), not just a quad on the TRANSLUCENT layer. */
+    public static boolean isThinDielectric(BlockState state) {
+        return state != null && THIN_DIELECTRIC.contains(state.getBlock());
+    }
+
     /** Perceptual roughness for this block's surface. */
     public static float roughness(BlockState state) {
         return profile(state).roughness();

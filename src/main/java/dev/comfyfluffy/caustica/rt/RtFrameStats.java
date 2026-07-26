@@ -57,7 +57,6 @@ public final class RtFrameStats {
                     "entity.capture.append.alloc",
                     "entity.capture.append.copy",
                     "entity.capture.append.blas",
-                    "entity.uploadFlush",
                     "entity.blockEntities",
                     "entity.particles",
                     "entity.blasRecord",
@@ -80,10 +79,7 @@ public final class RtFrameStats {
                     "entitySpecializedCuboids", "entityGenericCuboids",
                     "entityParityChecks", "entityVmaBufferCreates", "entityGeometryBufferReuses",
                     "entityScratchBufferReuses", "entityUploadBytes", "entityMotionUploadBytes",
-                    "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedGeometryBytes",
-                    "entityFrameListsWaits", "entityTableWaits", "entitySlotWaits",
-                    "entityGraphicsWaitNanos", "entityMotionFlushes", "entityTableFlushes",
-                    "entityBlockEntityRetirements", "entitySlotRetirements", "entityTableRetirements"},
+                    "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedGeometryBytes"},
             true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();

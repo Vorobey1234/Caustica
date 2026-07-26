@@ -31,7 +31,6 @@ import java.nio.LongBuffer;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
-import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 
@@ -68,15 +67,17 @@ public final class RtPipeline {
     private static final int MATERIAL_SURFACE0_BINDING = 1;
     private static final int MATERIAL_NORMAL_AO_BINDING = 2;
     private static final int MATERIAL_SURFACE1_BINDING = 3;
-    // A ring of descriptor sets: setTlas waits for the selected slot's exact prior graphics use before
-    // rewriting it. Ring depth is only a performance choice that avoids routine host waits.
+    // A ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating the
+    // slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
+    // The TLAS is rebuilt + rebound every frame (dynamic content), so a slot is reused every RING
+    // frames; RING must exceed the max frames-in-flight (vanilla MC ≤ 3) for the reused slot to be off
+    // all queues. 6 gives margin and matches the KEEP_FRAMES-style horizon used for resource frees.
     private static final int RING = 6;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
     private final long descriptorPool;
     private final long[] descriptorSets;
-    private final RtGpuExecutor.TrackedGraphicsUse[] descriptorSetUses;
     private int currentSet;
     private final long pipelineLayout;
     private final long pipeline;
@@ -94,18 +95,15 @@ public final class RtPipeline {
     private final long bindlessPool;
     private final long bindlessSet;
     private final int skyAtlasBinding;
+    private final int blueNoiseBinding;
     private boolean destroyed;
 
     private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int hitGroupCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
-                       long bindlessLayout, long bindlessPool, long bindlessSet, int skyAtlasBinding) {
+                       long bindlessLayout, long bindlessPool, long bindlessSet, int skyAtlasBinding, int blueNoiseBinding) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
         this.descriptorSets = sets;
-        this.descriptorSetUses = new RtGpuExecutor.TrackedGraphicsUse[sets.length];
-        for (int i = 0; i < descriptorSetUses.length; i++) {
-            descriptorSetUses[i] = new RtGpuExecutor.TrackedGraphicsUse();
-        }
         this.currentSet = 0;
         this.pipelineLayout = layout;
         this.pipeline = pipeline;
@@ -120,6 +118,7 @@ public final class RtPipeline {
         this.bindlessPool = bindlessPool;
         this.bindlessSet = bindlessSet;
         this.skyAtlasBinding = skyAtlasBinding;
+        this.blueNoiseBinding = blueNoiseBinding;
     }
 
     /**
@@ -151,7 +150,12 @@ public final class RtPipeline {
             // draw the sun/moon discs. Canonical material pages live in the bindless set, not set 0.
             int skyBinding = skyAtlas ? materialBase : -1;
             int skySamplers = skyAtlas ? 1 : 0;
-            int bindingCount = firstExtraBinding + extraStorageImages + skySamplers;
+            // Blue noise texture sampled by raygen for spatially decorrelated seed scrambling. Lives in
+            // set 0 (raygen-visible) right after the sky atlas so the world pipeline's bindless set is
+            // untouched. -1 when the caller did not request a blue noise binding.
+            int blueNoiseBinding = materialBase + skySamplers;
+            int blueNoiseSamplers = 1;
+            int bindingCount = firstExtraBinding + extraStorageImages + skySamplers + blueNoiseSamplers;
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
             binds.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
@@ -170,13 +174,16 @@ public final class RtPipeline {
                 binds.get(skyBinding).binding(skyBinding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
             }
+            binds.get(blueNoiseBinding).binding(blueNoiseBinding)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout");
             long dsl = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
-            int combinedSamplers = (withBlockAlbedoAtlas ? 1 : 0) + skySamplers;
+            int combinedSamplers = (withBlockAlbedoAtlas ? 1 : 0) + skySamplers + blueNoiseSamplers;
             int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0);
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(poolSizeCount, stack);
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
@@ -348,7 +355,7 @@ public final class RtPipeline {
             }
             sbt.flush();
             return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount, pushConstantSize, pcStages, firstExtraBinding,
-                    bindlessLayout, bindlessPool, bindlessSet, skyBinding);
+                    bindlessLayout, bindlessPool, bindlessSet, skyBinding, blueNoiseBinding);
         }
     }
 
@@ -365,12 +372,12 @@ public final class RtPipeline {
         return entityBucket == RtAccel.ENTITY_BUCKET_ANY_HIT;
     }
 
-    /** Bind a new TLAS after the selected descriptor slot's exact prior graphics use completes. */
-    public void setTlas(long tlas, RtGpuExecutor.GraphicsUse graphicsUse,
-                        RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
+    /**
+     * Bind a new TLAS into the next ring slot (which in-flight frames are no longer reading, since
+     * swaps are many frames apart) and make it current, so the binding can change without a drain.
+     */
+    public void setTlas(long tlas) {
         currentSet = (currentSet + 1) % RING;
-        RtGpuExecutor.TrackedGraphicsUse slotUse = descriptorSetUses[currentSet];
-        graphicsUseWaiter.await(slotUse);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas));
@@ -379,7 +386,6 @@ public final class RtPipeline {
                     .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
-        slotUse.mark(graphicsUse);
     }
 
     /** Write the storage image into every ring slot (set once at init / on resize, when idle). */
@@ -429,6 +435,16 @@ public final class RtPipeline {
         writeAtlasBinding(skyAtlasBinding, imageView, sampler);
     }
 
+    /** Bind the blue noise texture sampled by raygen for spatially decorrelated seed scrambling. */
+    public void setBlueNoise(long imageView, long sampler) {
+        writeAtlasBinding(blueNoiseBinding, imageView, sampler);
+    }
+
+    /** The blue noise binding slot, or -1 when the pipeline has no blue noise binding. */
+    public int blueNoiseBinding() {
+        return blueNoiseBinding;
+    }
+
     public boolean hasSkyAtlas() {
         return skyAtlasBinding >= 0;
     }
@@ -456,9 +472,9 @@ public final class RtPipeline {
 
     /** Bind one compact canonical page bundle at a resource-epoch boundary. */
     public void setMaterialPage(int page, long surface0View, long normalAoView, long surface1View,
-                                long sampler) {
+                                long sampler, long normalSampler) {
         setBindlessTexture(MATERIAL_SURFACE0_BINDING, page, surface0View, sampler);
-        setBindlessTexture(MATERIAL_NORMAL_AO_BINDING, page, normalAoView, sampler);
+        setBindlessTexture(MATERIAL_NORMAL_AO_BINDING, page, normalAoView, normalSampler);
         setBindlessTexture(MATERIAL_SURFACE1_BINDING, page, surface1View, sampler);
     }
 

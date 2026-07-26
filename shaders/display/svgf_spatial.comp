@@ -1,0 +1,84 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D inputColor;
+layout(binding = 1, r32f) uniform readonly image2D depth;
+layout(binding = 2, rgba16f) uniform readonly image2D normals;
+layout(binding = 3, rgba16f) uniform writeonly image2D outputColor;
+
+layout(push_constant) uniform Push {
+    float spatialSigma;
+    float depthSigma;
+    float normalSigma;
+    float luminanceSigma;
+} pc;
+
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputColor);
+    if (any(greaterThanEqual(pix, size))) return;
+
+    vec4 center = imageLoad(inputColor, pix);
+    float centerDepth = imageLoad(depth, pix).r;
+    vec3 centerNormal = imageLoad(normals, pix).xyz;
+    float centerNormalLength = length(centerNormal);
+    bool centerSky = centerNormalLength < 0.25;
+    if (!centerSky) centerNormal /= centerNormalLength;
+    float centerLuminance = luminance(center.rgb);
+
+    // Estimate local luminance variance first. No shared-memory barrier is used:
+    // partial workgroups at image edges must be allowed to return safely.
+    float mean = 0.0;
+    float secondMoment = 0.0;
+    int momentCount = 0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(pix + ivec2(x, y), ivec2(0), size - ivec2(1));
+            float l = luminance(imageLoad(inputColor, q).rgb);
+            mean += l;
+            secondMoment += l * l;
+            ++momentCount;
+        }
+    }
+    mean /= float(momentCount);
+    float deviation = sqrt(max(secondMoment / float(momentCount) - mean * mean, 0.0));
+    float lumaScale = max(pc.luminanceSigma * (deviation + 0.05 * max(centerLuminance, 0.02)), 1.0e-3);
+
+    vec4 sum = vec4(0.0);
+    float weightSum = 0.0;
+    const int radius = 2;
+    float spatialDenominator = max(2.0 * pc.spatialSigma * pc.spatialSigma, 1.0e-4);
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            ivec2 q = clamp(pix + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec4 sampleColor = imageLoad(inputColor, q);
+            float sampleDepth = imageLoad(depth, q).r;
+            vec3 sampleNormal = imageLoad(normals, q).xyz;
+            float sampleNormalLength = length(sampleNormal);
+            bool sampleSky = sampleNormalLength < 0.25;
+
+            float spatialWeight = exp(-float(x * x + y * y) / spatialDenominator);
+            float depthScale = max(max(abs(centerDepth), abs(sampleDepth)), 1.0e-4);
+            float depthWeight = exp(-abs(sampleDepth - centerDepth)
+                    / max(pc.depthSigma * depthScale, 1.0e-5));
+            float normalWeight;
+            if (centerSky || sampleSky) {
+                normalWeight = centerSky == sampleSky ? 1.0 : 0.0;
+            } else {
+                sampleNormal /= sampleNormalLength;
+                normalWeight = pow(max(dot(centerNormal, sampleNormal), 0.0), pc.normalSigma);
+            }
+            float lumaWeight = exp(-abs(luminance(sampleColor.rgb) - centerLuminance) / lumaScale);
+            float weight = spatialWeight * depthWeight * normalWeight * lumaWeight;
+            sum += sampleColor * weight;
+            weightSum += weight;
+        }
+    }
+
+    imageStore(outputColor, pix, weightSum > 0.0 ? sum / weightSum : center);
+}

@@ -339,6 +339,24 @@ public final class RtEntityCapture implements VertexConsumer {
         appendQuad(x, y, z, corners, u, v, nx, ny, nz, color, uvRemap, 0f);
     }
 
+    /**
+     * Append a single triangle (e.g. from a resource-pack sphere model emitted through the Fabric
+     * Renderer API's {@code CustomGeometryRenderer}). The triangle is stored as a degenerate quad
+     * (vertex 3 = vertex 2): the second triangle produced by the standard quad index pattern
+     * (0,2,3) becomes zero-area and is never hit by the ray tracer, so the visible result is exactly
+     * one triangle. This reuses the entire existing quad-based upload/BLAS/prim-record pipeline
+     * without a separate triangle path.
+     */
+    void addDirectTriangle(float[] x, float[] y, float[] z, float[] u, float[] v,
+                           float nx, float ny, float nz, int color) {
+        float[] tx = {x[0], x[1], x[2], x[2]};
+        float[] ty = {y[0], y[1], y[2], y[2]};
+        float[] tz = {z[0], z[1], z[2], z[2]};
+        float[] tu = {u[0], u[1], u[2], u[2]};
+        float[] tv = {v[0], v[1], v[2], v[2]};
+        appendQuad(tx, ty, tz, null, tu, tv, nx, ny, nz, color, uvRemap, 0f);
+    }
+
     private void appendQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
                             float nx, float ny, float nz, int color, boolean remapUv, float emission) {
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
@@ -390,6 +408,7 @@ public final class RtEntityCapture implements VertexConsumer {
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
         float tb = (c & 0xFF) * (1f / 255f);
+        int tangentFrame = packTangentFrame(x, y, z, corners, u, v, nx, ny, nz, remapUv);
         for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
             prim.add(nx);
             prim.add(ny);
@@ -401,10 +420,53 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
             prim.add(Float.intBitsToFloat(currentMaterialId));
             prim.add(0f); // flags
-            prim.add(0f); // aux0
+            prim.add(Float.intBitsToFloat(tangentFrame)); // aux0 = packed tangent frame shared by both triangles
             prim.add(0f); // aux1
             alphaBuckets.add(currentAlphaBucket);
         }
+    }
+
+    private int packTangentFrame(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
+                                 float nx, float ny, float nz, boolean remapUv) {
+        int p0 = positionIndex(corners, 0);
+        int p1 = positionIndex(corners, 1);
+        int p2 = positionIndex(corners, 2);
+        float u0 = remapUv ? uvU0 + u[0] * uvDU : u[0];
+        float v0 = remapUv ? uvV0 + v[0] * uvDV : v[0];
+        float u1 = remapUv ? uvU0 + u[1] * uvDU : u[1];
+        float v1 = remapUv ? uvV0 + v[1] * uvDV : v[1];
+        float u2 = remapUv ? uvU0 + u[2] * uvDU : u[2];
+        float v2 = remapUv ? uvV0 + v[2] * uvDV : v[2];
+        float du1 = u1 - u0, dv1 = v1 - v0;
+        float du2 = u2 - u0, dv2 = v2 - v0;
+        float det = du1 * dv2 - dv1 * du2;
+        if (Math.abs(det) <= 1.0e-12f) return 0;
+
+        float ex1 = x[p1] - x[p0], ey1 = y[p1] - y[p0], ez1 = z[p1] - z[p0];
+        float ex2 = x[p2] - x[p0], ey2 = y[p2] - y[p0], ez2 = z[p2] - z[p0];
+        float invDet = 1.0f / det;
+        float tx = (ex1 * dv2 - ex2 * dv1) * invDet;
+        float ty = (ey1 * dv2 - ey2 * dv1) * invDet;
+        float tz = (ez1 * dv2 - ez2 * dv1) * invDet;
+        float ndt = nx * tx + ny * ty + nz * tz;
+        tx -= nx * ndt; ty -= ny * ndt; tz -= nz * ndt;
+        float tlen = (float) Math.sqrt(tx * tx + ty * ty + tz * tz);
+        if (tlen <= 1.0e-7f) return 0;
+        tx /= tlen; ty /= tlen; tz /= tlen;
+
+        float bx = (-ex1 * du2 + ex2 * du1) * invDet;
+        float by = (-ey1 * du2 + ey2 * du1) * invDet;
+        float bz = (-ez1 * du2 + ez2 * du1) * invDet;
+        float cx = ny * tz - nz * ty;
+        float cy = nz * tx - nx * tz;
+        float cz = nx * ty - ny * tx;
+        float handedness = cx * bx + cy * by + cz * bz < 0.0f ? -1.0f : 1.0f;
+        return packSnorm8(tx) | (packSnorm8(ty) << 8) | (packSnorm8(tz) << 16)
+                | (packSnorm8(handedness) << 24);
+    }
+
+    private static int packSnorm8(float value) {
+        return Math.round(Math.max(-1.0f, Math.min(1.0f, value)) * 127.0f) & 0xFF;
     }
 
     private static int positionIndex(int[] corners, int vertex) {

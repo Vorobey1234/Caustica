@@ -1,0 +1,336 @@
+#version 460
+
+// Blockwise Multi-Order Feature Regression (BMFR) adapted for Caustica's Vulkan guide buffers.
+// The original BMFR method uses normal and polynomial position features.  This implementation adds
+// albedo features to keep texture edges stable, solves a small ridge-regularized least-squares system
+// per 8x8 block, and temporally accumulates the fitted result with depth/normal disocclusion tests.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D noisyColor;
+layout(binding = 1, r32f)    uniform readonly image2D depthGuide;
+layout(binding = 2, rg16f)   uniform readonly image2D motionGuide;
+layout(binding = 3, rgba16f) uniform readonly image2D normalGuide;
+layout(binding = 4, rgba16f) uniform readonly image2D albedoGuide;
+layout(binding = 5, rgba16f) uniform readonly image2D historyColor;
+layout(binding = 6, r32f)    uniform readonly image2D historyDepth;
+layout(binding = 7, rgba16f) uniform readonly image2D historyNormal;
+layout(binding = 8, rgba16f) uniform writeonly image2D outputColor;
+
+layout(push_constant) uniform Push {
+    mat4 invViewProj;
+    float depthThreshold;
+    float normalThreshold;
+    float historyWeight;
+    float ridge;
+    uint frameIndex;
+    uint resetHistory;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+const int BLOCK_EDGE = 8;
+const int PIXELS = BLOCK_EDGE * BLOCK_EDGE;
+const int FEATURES = 13;
+
+shared vec3 sPosition[PIXELS];
+shared vec3 sNormal[PIXELS];
+shared vec3 sAlbedo[PIXELS];
+shared vec3 sTarget[PIXELS];
+shared float sDepth[PIXELS];
+shared float sFeatures[PIXELS * FEATURES];
+shared float sMatrix[FEATURES * FEATURES];
+shared vec3 sRight[FEATURES];
+shared vec3 sCoeff[FEATURES];
+shared vec3 sMeanPosition;
+shared float sPositionScale;
+shared vec3 sTargetMean;
+shared vec3 sTargetSigma;
+shared int sSurfaceCount;
+
+vec3 compressHdr(vec3 color) {
+    color = max(color, vec3(0.0));
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    return color / (1.0 + luma);
+}
+
+vec3 expandHdr(vec3 color) {
+    color = max(color, vec3(0.0));
+    float compressedLuma = clamp(dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.0, 0.995);
+    return color / max(1.0 - compressedLuma, 0.005);
+}
+
+vec3 reconstructPosition(ivec2 pixel, float depth, ivec2 size) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 h = pc.invViewProj * vec4(ndc, depth, 1.0);
+    return h.xyz / max(abs(h.w), 1.0e-7) * sign(h.w);
+}
+
+void writeFeatures(int index) {
+    vec3 q = (sPosition[index] - sMeanPosition) * sPositionScale;
+    vec3 n = sNormal[index];
+    vec3 a = sAlbedo[index];
+    int base = index * FEATURES;
+    sFeatures[base + 0] = 1.0;
+    sFeatures[base + 1] = n.x;
+    sFeatures[base + 2] = n.y;
+    sFeatures[base + 3] = n.z;
+    sFeatures[base + 4] = q.x;
+    sFeatures[base + 5] = q.y;
+    sFeatures[base + 6] = q.z;
+    sFeatures[base + 7] = q.x * q.x;
+    sFeatures[base + 8] = q.y * q.y;
+    sFeatures[base + 9] = q.z * q.z;
+    sFeatures[base + 10] = a.x;
+    sFeatures[base + 11] = a.y;
+    sFeatures[base + 12] = a.z;
+}
+
+bool validHistoryTap(ivec2 q, ivec2 size, float currentDepth, vec3 currentNormal) {
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) return false;
+    float previousDepth = imageLoad(historyDepth, q).r;
+    vec3 previousNormal = imageLoad(historyNormal, q).xyz;
+    float previousLengthSq = dot(previousNormal, previousNormal);
+    if (previousLengthSq < 0.0625) return false;
+    float depthScale = max(max(abs(currentDepth), abs(previousDepth)), 1.0e-5);
+    float depthError = abs(currentDepth - previousDepth) / depthScale;
+    // currentNormal is normalized once before reprojection; normalize only the history tap here.
+    float normalAgreement = dot(currentNormal, previousNormal) * inversesqrt(previousLengthSq);
+    return depthError <= pc.depthThreshold && normalAgreement >= pc.normalThreshold;
+}
+
+vec3 reprojectHistory(ivec2 pixel, ivec2 size, float currentDepth, vec3 currentNormal,
+                      vec2 motion, out float validWeight) {
+    // gMotion follows the old = new + motion convention used by NRD/DLSS.
+    // Adding the vector is essential: subtracting it samples the opposite side of moving edges and
+    // produces long temporal trails while the camera or geometry moves.
+    vec2 previous = vec2(pixel) + 0.5 + motion;
+    ivec2 base = ivec2(floor(previous - 0.5));
+    vec2 f = fract(previous - 0.5);
+    ivec2 taps[4] = ivec2[4](base, base + ivec2(1, 0), base + ivec2(0, 1), base + ivec2(1, 1));
+    float weights[4] = float[4]((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+                                (1.0 - f.x) * f.y, f.x * f.y);
+    vec3 result = vec3(0.0);
+    validWeight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        if (validHistoryTap(taps[i], size, currentDepth, currentNormal)) {
+            vec4 h = imageLoad(historyColor, taps[i]);
+            if (h.a > 0.5) {
+                result += compressHdr(h.rgb) * weights[i];
+                validWeight += weights[i];
+            }
+        }
+    }
+    return validWeight > 1.0e-5 ? result / validWeight : vec3(0.0);
+}
+
+void main() {
+    ivec2 size = imageSize(noisyColor);
+    int localIndex = int(gl_LocalInvocationIndex);
+
+    // Four staggered block origins remove persistent 8x8 seams after temporal accumulation.  The extra
+    // workgroup dispatched on each axis covers the negative half-block offset at the opposite edge.
+    ivec2 offsets[4] = ivec2[4](ivec2(0), ivec2(-4, 0), ivec2(0, -4), ivec2(-4, -4));
+    ivec2 blockOffset = offsets[int(pc.frameIndex & 3u)];
+    ivec2 blockBase = ivec2(gl_WorkGroupID.xy) * BLOCK_EDGE + blockOffset;
+    ivec2 pixel = blockBase + ivec2(gl_LocalInvocationID.xy);
+    bool inBounds = all(greaterThanEqual(pixel, ivec2(0))) && all(lessThan(pixel, size));
+    ivec2 samplePixel = clamp(pixel, ivec2(0), size - ivec2(1));
+
+    float d = imageLoad(depthGuide, samplePixel).r;
+    vec3 n = imageLoad(normalGuide, samplePixel).xyz;
+    float normalLengthSq = dot(n, n);
+    n = normalLengthSq > 0.0625 ? n * inversesqrt(normalLengthSq) : vec3(0.0);
+    vec3 a = max(imageLoad(albedoGuide, samplePixel).rgb, vec3(0.0));
+    vec3 target = compressHdr(imageLoad(noisyColor, samplePixel).rgb);
+    sDepth[localIndex] = d;
+    sNormal[localIndex] = n;
+    sAlbedo[localIndex] = a;
+    sTarget[localIndex] = target;
+    sPosition[localIndex] = d > 1.0e-7 ? reconstructPosition(samplePixel, d, size) : vec3(0.0);
+    barrier();
+
+    if (localIndex == 0) {
+        vec3 meanP = vec3(0.0);
+        vec3 meanC = vec3(0.0);
+        int surfaceCount = 0;
+        for (int i = 0; i < PIXELS; ++i) {
+            if (sDepth[i] > 1.0e-7 && dot(sNormal[i], sNormal[i]) > 0.0625) {
+                meanP += sPosition[i];
+                meanC += sTarget[i];
+                ++surfaceCount;
+            }
+        }
+        float invCount = 1.0 / float(max(surfaceCount, 1));
+        meanP *= invCount;
+        meanC *= invCount;
+        float maxExtent = 1.0e-3;
+        vec3 variance = vec3(0.0);
+        for (int i = 0; i < PIXELS; ++i) {
+            if (sDepth[i] > 1.0e-7 && dot(sNormal[i], sNormal[i]) > 0.0625) {
+                maxExtent = max(maxExtent, length(sPosition[i] - meanP));
+                vec3 delta = sTarget[i] - meanC;
+                variance += delta * delta;
+            }
+        }
+        sMeanPosition = meanP;
+        sPositionScale = 1.0 / maxExtent;
+        sTargetMean = meanC;
+        sTargetSigma = sqrt(max(variance * invCount, vec3(0.0)));
+        sSurfaceCount = surfaceCount;
+    }
+    barrier();
+
+    writeFeatures(localIndex);
+    barrier();
+
+    // Build the symmetric normal matrix in parallel. The old path made invocation 0 perform every
+    // one of the 13x13x64 products serially; one invocation per feature row now computes only the upper
+    // triangle and mirrors it, cutting the products almost in half and distributing them across the group.
+    if (localIndex < FEATURES) {
+        int r = localIndex;
+        float row[FEATURES];
+        for (int c = 0; c < FEATURES; ++c) row[c] = 0.0;
+        vec3 right = vec3(0.0);
+        for (int i = 0; i < PIXELS; ++i) {
+            if (sDepth[i] <= 1.0e-7 || dot(sNormal[i], sNormal[i]) <= 0.0625) continue;
+            int base = i * FEATURES;
+            float fr = sFeatures[base + r];
+            right += fr * sTarget[i];
+            for (int c = r; c < FEATURES; ++c) row[c] += fr * sFeatures[base + c];
+        }
+        sRight[r] = right;
+        for (int c = r; c < FEATURES; ++c) {
+            sMatrix[r * FEATURES + c] = row[c];
+            sMatrix[c * FEATURES + r] = row[c];
+        }
+    }
+    barrier();
+
+    if (localIndex == 0) {
+        float regularization = max(pc.ridge, 1.0e-5) * float(max(sSurfaceCount, 1));
+        for (int i = 1; i < FEATURES; ++i) sMatrix[i * FEATURES + i] += regularization;
+        sMatrix[0] += regularization * 0.02;
+
+        // Pivoted Gauss-Jordan solve of (F^T F + lambda I) C = F^T Y. At only 13 features this is
+        // considerably smaller than the reference implementation's full-frame QR scratch.
+        for (int column = 0; column < FEATURES; ++column) {
+            int pivot = column;
+            float pivotMagnitude = abs(sMatrix[column * FEATURES + column]);
+            for (int rowIndex = column + 1; rowIndex < FEATURES; ++rowIndex) {
+                float candidate = abs(sMatrix[rowIndex * FEATURES + column]);
+                if (candidate > pivotMagnitude) { pivotMagnitude = candidate; pivot = rowIndex; }
+            }
+            if (pivot != column) {
+                for (int c = 0; c < FEATURES; ++c) {
+                    float temporary = sMatrix[column * FEATURES + c];
+                    sMatrix[column * FEATURES + c] = sMatrix[pivot * FEATURES + c];
+                    sMatrix[pivot * FEATURES + c] = temporary;
+                }
+                vec3 temporaryRight = sRight[column];
+                sRight[column] = sRight[pivot];
+                sRight[pivot] = temporaryRight;
+            }
+            float divisor = sMatrix[column * FEATURES + column];
+            if (abs(divisor) < 1.0e-7) divisor = divisor < 0.0 ? -1.0e-7 : 1.0e-7;
+            float inverseDivisor = 1.0 / divisor;
+            for (int c = column; c < FEATURES; ++c) sMatrix[column * FEATURES + c] *= inverseDivisor;
+            sRight[column] *= inverseDivisor;
+            for (int rowIndex = 0; rowIndex < FEATURES; ++rowIndex) {
+                if (rowIndex == column) continue;
+                float factor = sMatrix[rowIndex * FEATURES + column];
+                if (abs(factor) < 1.0e-10) continue;
+                for (int c = column; c < FEATURES; ++c) {
+                    sMatrix[rowIndex * FEATURES + c] -= factor * sMatrix[column * FEATURES + c];
+                }
+                sRight[rowIndex] -= factor * sRight[column];
+            }
+        }
+        for (int i = 0; i < FEATURES; ++i) sCoeff[i] = sRight[i];
+    }
+    barrier();
+
+    if (!inBounds) return;
+    if (d <= 1.0e-7 || normalLengthSq <= 0.0625) {
+        imageStore(outputColor, pixel, vec4(imageLoad(noisyColor, pixel).rgb, 1.0));
+        return;
+    }
+
+    vec3 fitted = vec3(0.0);
+    int featureBase = localIndex * FEATURES;
+    for (int i = 0; i < FEATURES; ++i) fitted += sCoeff[i] * sFeatures[featureBase + i];
+    // Regression outliers are clipped in the bounded HDR domain, retaining highlights without fireflies.
+    vec3 extent = max(sTargetSigma * 2.75, vec3(0.012));
+    fitted = clamp(fitted, max(sTargetMean - extent, vec3(0.0)), sTargetMean + extent);
+
+    vec2 motion = imageLoad(motionGuide, pixel).xy;
+    float validWeight;
+    vec3 history = reprojectHistory(pixel, size, d, n, motion, validWeight);
+
+    // Rectify history against a current-frame 3x3 neighbourhood, not only the whole 8x8 regression
+    // block.  The tighter local box prevents foreground colours from surviving behind moving objects.
+    vec3 localMean = vec3(0.0);
+    vec3 localSecondMoment = vec3(0.0);
+    vec3 localMinimum = vec3(1.0e20);
+    vec3 localMaximum = vec3(-1.0e20);
+    vec3 localAlbedoMean = vec3(0.0);
+    float albedoContrastSq = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), size - ivec2(1));
+            ivec2 localQ = q - blockBase;
+            bool sharedTap = all(greaterThanEqual(localQ, ivec2(0)))
+                    && all(lessThan(localQ, ivec2(BLOCK_EDGE)));
+            vec3 sampleValue;
+            vec3 sampleAlbedo;
+            if (sharedTap) {
+                int sharedIndex = localQ.y * BLOCK_EDGE + localQ.x;
+                sampleValue = sTarget[sharedIndex];
+                sampleAlbedo = sAlbedo[sharedIndex];
+            } else {
+                sampleValue = compressHdr(imageLoad(noisyColor, q).rgb);
+                sampleAlbedo = max(imageLoad(albedoGuide, q).rgb, vec3(0.0));
+            }
+            localMean += sampleValue;
+            localSecondMoment += sampleValue * sampleValue;
+            localMinimum = min(localMinimum, sampleValue);
+            localMaximum = max(localMaximum, sampleValue);
+            localAlbedoMean += sampleAlbedo;
+            vec3 albedoDelta = sampleAlbedo - a;
+            albedoContrastSq = max(albedoContrastSq, dot(albedoDelta, albedoDelta));
+        }
+    }
+    localMean *= 1.0 / 9.0;
+    localAlbedoMean *= 1.0 / 9.0;
+    vec3 localSigma = sqrt(max(localSecondMoment * (1.0 / 9.0) - localMean * localMean, vec3(0.0)));
+    vec3 localExtent = max(localSigma * 1.35, vec3(0.006));
+    vec3 historyMinimum = max(max(localMean - localExtent, localMinimum), vec3(0.0));
+    vec3 historyMaximum = min(localMean + localExtent, localMaximum);
+    history = clamp(history, historyMinimum, max(historyMaximum, historyMinimum));
+
+    // Regression is intentionally smooth, but the old implementation treated the fitted radiance as
+    // the complete final colour and therefore erased Minecraft's high-frequency albedo pattern. Restore
+    // only the current-frame detail that is supported by an actual albedo change. Flat surfaces keep the
+    // strong denoising; texture texels and cutout foliage retain their crisp boundaries without a generic
+    // post-process sharpen or unrestricted noisy-colour blend.
+    vec3 current = sTarget[localIndex];
+    vec3 rawDetail = current - localMean;
+    vec3 albedoDetail = abs(a - localAlbedoMean);
+    vec3 detailLimit = vec3(0.006) + albedoDetail * 0.55;
+    rawDetail = clamp(rawDetail, -detailLimit, detailLimit);
+    float albedoContrast = sqrt(albedoContrastSq);
+    float detailStrength = mix(0.10, 0.82, smoothstep(0.015, 0.22, albedoContrast));
+    vec3 texturePreserved = clamp(fitted + rawDetail * detailStrength,
+            max(localMinimum - vec3(0.004), vec3(0.0)), localMaximum + vec3(0.004));
+
+    float motionConfidence = 1.0 - smoothstep(0.75, 14.0, length(motion));
+    float relativeDifference = length(history - texturePreserved) / max(length(texturePreserved), 0.08);
+    float colorConfidence = 1.0 - smoothstep(0.18, 0.75, relativeDifference);
+    float temporalWeight = pc.resetHistory != 0u ? 0.0
+            : clamp(pc.historyWeight
+                    * smoothstep(0.30, 0.95, validWeight)
+                    * motionConfidence * colorConfidence, 0.0, 0.70);
+    vec3 result = mix(texturePreserved, history, temporalWeight);
+    imageStore(outputColor, pixel, vec4(expandHdr(result), 1.0));
+}

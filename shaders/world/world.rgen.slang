@@ -6,8 +6,8 @@
 //
 // Lighting is an iterative path-tracing loop in raygen, not recursion from closest-hit, so
 // maxRayRecursionDepth stays 1. At each surface vertex:
-//   * NEE toward the sun — a single analytic directional light, gated by one hit-object visibility query
-//     (TerminateOnFirstHit | SkipClosestHit). Lambertian BRDF = albedo/PI.
+//   * NEE toward the sun/moon plus reservoir-sampled local emissive point lights, each gated by
+//     ray-traced visibility. Primary celestial shadows use an antithetic two-sample pair.
 //   * a cosine-weighted Lambertian continuation ray (throughput *= albedo; the PI and cos cancel).
 // Sky / ambient light needs no separate AO pass: continuation rays that escape land in world.rmiss,
 // which returns sky radiance — so soft sky fill and contact AO both fall out of the path integral.
@@ -19,6 +19,7 @@
 // Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the denoiser's
 // job. With RR disabled the output is the raw noisy path trace — a reference view, not a converged image.
 import world_common;
+import cloud_common;
 
 [[vk::push_constant]] WorldPushConstants pc;
 
@@ -33,19 +34,21 @@ import world_common;
 [[vk::binding(6, 0)]] [format("rg16f")]   RWTexture2D<float2> gMotion;     // screen-space motion (render px)
 [[vk::binding(7, 0)]] [format("rgba16f")] RWTexture2D<float4> gSpecAlbedo; // specular albedo (0 — diffuse-only)
 [[vk::binding(8, 0)]] [format("rg16f")]   RWTexture2D<float2> gSpecMotion; // reflection MVs for RR
+// Native-only accumulation history. Raygen updates these images only for pixels that receive a genuine
+// ray in the current sparse phase. Alpha in rawHistoryColor stores that pixel's native sample count.
+// Never alias these with checkerboard resolved history, which contains reconstructed neighbour values.
+[[vk::binding(9, 0)]]  [format("rgba16f")] RWTexture2D<float4> rawHistoryColor;
+[[vk::binding(10, 0)]] [format("rgba16f")] RWTexture2D<float4> rawHistoryNormal;
+[[vk::binding(11, 0)]] [format("r32f")]    RWTexture2D<float>  rawHistoryDepth;
 
 // Per-frame push data loaded once from the BDA buffer at the top of main() (same pattern as the GLSL
 // `worldPush` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
 static WorldPush worldPush;
 
-// The radiance payload remains module-level so tracePath and its guide helpers can share it across
-// HitObject trace/invoke calls, mirroring the GLSL rayPayloadEXT global.
+// Ray payloads. Module-level statics so the helper functions (visibility / refractedGuideHit /
+// specularReflectionMotion / tracePath) can share them, mirroring the GLSL rayPayloadEXT globals.
 static Payload payload;
-
-struct VisibilityResult {
-    float3 transmittance;
-    float waterHitT;
-};
+static float4 shadowVis; // rgb = transmittance; a = nearest water-crossing t (-1 = none)
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
 // is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
@@ -63,6 +66,8 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 static float3 gv_motionObjDisp;
+// Only immutable primary surfaces are eligible for native raw accumulation.
+static bool gv_historyStable;
 
 uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
 uint payloadEmissionSource() {
@@ -71,13 +76,16 @@ uint payloadEmissionSource() {
 // Set by world.rchit only on a MATERIAL_WATER hit (see PAYLOAD_WATER_ENTERING) — whether the ray was
 // travelling into the water volume (vs. out of it) at this hit's face.
 bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
-bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
 float payloadRoughness() { return unpackHalf2(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2(payload.emissionSss).x; }
 float payloadSss() { return unpackHalf2(payload.emissionSss).y; }
 float payloadIor() { return unpackHalf2(payload.iorTransmission).x; }
 float payloadTransmission() { return unpackHalf2(payload.iorTransmission).y; }
+void payloadSetTraceState(bool showCelestial, float rayConeWidth, float rayConeSpread) {
+    payload.flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
+    payload.rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
+}
 
 static const float PI = 3.14159265359;
 static const float INV_PI = 0.31830988618;
@@ -85,6 +93,7 @@ static const float INV_PI = 0.31830988618;
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen
 // reads payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately
 // as worldPush.lightDir / worldPush.lightRadiance / worldPush.sunDir.
+static const float EMISSIVE_STRENGTH = 6.25; // brighter HDR radiance; local-light NEE now handles illumination efficiently
 static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -92,6 +101,32 @@ static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already c
 static const float WATER_IOR = 1.333;
 static const float3 SKY_SPEC_ALBEDO = float3(0.5, 0.5, 0.5); // RR guide default for sky pixels.
 static const float3 SKY_DIFF_ALBEDO = float3(0.5, 0.5, 0.5);
+
+CloudParams sceneCloudParams() {
+    CloudParams params;
+    params.weather = worldPush.weather;
+    params.climate = worldPush.cloudParams.xy;
+    params.worldOrigin = worldPush.cloudParams.zw;
+    return params;
+}
+
+float cloudShadowTransmittance(float3 surfacePos, float3 lightDir) {
+    // Only the sun produces visible terrain shadows. Moonlight remains softly ambient and avoids
+    // noisy, nearly black checker patterns at night.
+    float daylight = smoothstep(-0.02, 0.16, worldPush.sunDir.y);
+    float grazing = smoothstep(0.015, 0.12, lightDir.y);
+    if (daylight <= 0.0 || grazing <= 0.0) return 1.0;
+    CloudParams params = sceneCloudParams();
+    float t0, t1;
+    if (!cloudInterval(surfacePos, lightDir, t0, t1)) return 1.0;
+    float stepLength = (t1 - t0) / 6.0;
+    float opticalDepth = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        float3 samplePos = surfacePos + lightDir * (t0 + (float(i) + 0.5) * stepLength);
+        opticalDepth += cloudDensity(samplePos, params) * stepLength * CLOUD_SIGMA_T;
+    }
+    return lerp(1.0, exp(-opticalDepth * 1.35), daylight * grazing);
+}
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass).
 // Transmitted-ray origin offset when crossing a glass face. Must be SMALLER than the terrain-side
@@ -179,9 +214,9 @@ float3 applyWaterWaves(float3 nGeo, float2 worldXZ, float t) {
 // ---- Water caustics. Sunlight refracting through the waved surface converges/diverges before it
 // reaches an underwater receiver; the analytic wave field makes the true focusing factor computable
 // instead of faked with a scrolling texture. Where the shadow ray of an underwater NEE vertex crossed
-// water (returned by visibility() as VisibilityResult.waterHitT), evaluate the horizontal landing
-// position of the refracted sun ray as a function of surface position and finite-difference it. The
-// caustic intensity is the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
+// water (recorded by world.rahit in shadowVis.a), evaluate the horizontal landing position of the
+// refracted sun ray as a function of surface position and finite-difference it: the caustic intensity is
+// the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
 // fold caustics where det → 0). Because this uses the SAME wave field as the visible surface normals,
 // the caustic pattern stays in sync with the ripples, and the per-sample sun-quad jitter (sampleSquare)
 // shifts the pattern per sample → caustics physically blur with depth under DLSS-RR accumulation.
@@ -247,11 +282,7 @@ float3 fresnelSchlick(float cosT, float3 f0) {
 // g=0 → isotropic; g>0 → forward-scatter peak at cosT=1 (light and view aligned through a thin slab).
 static const float SSS_G        = 0.6; // forward-scatter anisotropy; leaves/grass are quite directional
 static const float SSS_STRENGTH = 1.0; // 1.0 ≈ 2.5× the Lambertian at peak (sss=1, cosT=1, backNdl=1)
-// Deepest SHADED surface at which the SSS transmission shadow ray fires. diffuseDepth, not `bounce`: the
-// glass/water continue branches don't shade a surface, so foliage seen through a window is still
-// diffuseDepth 0 and should backlight like any other primary leaf — see RIS_MAX_DIFFUSE_DEPTH for the
-// same distinction and why it matters.
-static const int   MAX_SSS_DIFFUSE_DEPTH = 1; // fire on the first-shaded surface + one indirect hit
+static const int   MAX_SSS_BOUNCE = 1; // fire the transmission shadow ray on primary + first indirect hit only
 float hg(float cosT, float g) {
     float g2 = g * g;
     return (1.0 - g2) / (4.0 * PI * pow(max(0.0, 1.0 + g2 - 2.0 * g * cosT), 1.5));
@@ -311,11 +342,53 @@ uint pcg(inout uint s) {
     uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
     return (w >> 22u) ^ w;
 }
-float rndf(inout uint s) {
-    // Convert the high 24 bits, which are exactly representable as float. Converting all 32 bits first
-    // lets the top 128 uint values round to 2^32, incorrectly returning 1.0 and breaking `< probability`
-    // tests (most seriously the F == 1 total-internal-reflection branch).
-    return float(pcg(s) >> 8u) * (1.0 / 16777216.0);
+float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294966296.0); }
+
+// World-space value noise for rain puddles. Unlike a per-block/material random value, this field is
+// continuous at integer block boundaries, so a puddle may span several adjacent top faces without a
+// visible square cutoff. The caller supplies a rebasing-stable world coordinate.
+float puddleHash(float2 cell) {
+    float3 p = frac(float3(cell.x, cell.y, cell.x) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return frac((p.x + p.y) * p.z);
+}
+
+float puddleValueNoise(float2 p) {
+    float2 cell = floor(p);
+    float2 f = frac(p);
+    float2 w = f * f * (3.0 - 2.0 * f);
+    float n00 = puddleHash(cell);
+    float n10 = puddleHash(cell + float2(1.0, 0.0));
+    float n01 = puddleHash(cell + float2(0.0, 1.0));
+    float n11 = puddleHash(cell + float2(1.0, 1.0));
+    return lerp(lerp(n00, n10, w.x), lerp(n01, n11, w.x), w.y);
+}
+
+float puddleField(float2 worldXZ) {
+    // World-space micro-topography: a broad drainage basin is gently eroded by medium and fine
+    // variations. This produces coherent pools with irregular soft shores instead of isolated noise dots.
+    float basin = puddleValueNoise(worldXZ * 0.045);
+    basin = basin * 0.66 + puddleValueNoise(worldXZ * 0.086 + float2(31.7, -14.2)) * 0.34;
+    float erosion = puddleValueNoise(worldXZ * 0.19 + float2(-8.4, 23.1));
+    return basin * 0.82 + erosion * 0.18;
+}
+
+// Blue noise texture (128x128 R8_UNORM, generated by BlueNoiseGenerator and bound by RtComposite).
+// Sampled with a golden-ratio temporal rotation so neighbouring pixels get uncorrelated seeds without
+// the structured (concentric-ring / checkerboard) artifacts a hardcoded Bayer-style table imposes on
+// flat surfaces like grass fields. Binding 10 = materialBase (9) + skySamplers (1) — see RtPipeline.create.
+[[vk::binding(13, 0)]] Sampler2D blueNoiseTex;
+
+float blueNoiseRand(int2 pix, uint frame) {
+    uint2 size;
+    blueNoiseTex.GetDimensions(size.x, size.y);
+    // Tile the texture across the screen, then rotate the per-tile sample offset by a golden-ratio
+    // fraction each frame to break temporal aliasing. The result is high-frequency spatial noise that
+    // converges quickly under temporal accumulation and the denoiser.
+    int2 tile = pix & int2(int(size.x) - 1, int(size.y) - 1);
+    uint rot = (frame * 167u) & 255u;
+    float base = blueNoiseTex.SampleLevel(float2(tile) / float2(size), 0.0).r;
+    return frac(base + float(rot) * 0.61803398875);
 }
 
 float3 primaryRayDir(float2 ndc) {
@@ -353,13 +426,20 @@ float3 cosineDir(float3 n, inout uint s) {
 // visible disc in world.rmiss uses, built from the same celestial tangent frame (right = arc-travel
 // direction, from worldPush.celestial.xyz). Averaged over frames by DLSS-RR this yields soft penumbrae that
 // widen with occluder distance (contact-hardening) for free. halfAngle <= 0 ⇒ exact direction (hard).
-float3 sampleSquare(float3 axis, float halfAngle, inout uint s) {
-    float3 right = normalize(cross(axis, worldPush.celestial.xyz));
+float3 sampleSquareXi(float3 axis, float halfAngle, float2 xi) {
+    float3 right = cross(axis, worldPush.celestial.xyz);
+    if (dot(right, right) < 1.0e-7) right = cross(axis, float3(0.0, 1.0, 0.0));
+    if (dot(right, right) < 1.0e-7) right = cross(axis, float3(1.0, 0.0, 0.0));
+    right = normalize(right);
     float3 up = cross(right, axis);
     float t = tan(halfAngle);
-    float u = (rndf(s) * 2.0 - 1.0) * t;
-    float v = (rndf(s) * 2.0 - 1.0) * t;
+    float u = (xi.x * 2.0 - 1.0) * t;
+    float v = (xi.y * 2.0 - 1.0) * t;
     return normalize(axis + u * right + v * up);
+}
+
+float3 sampleSquare(float3 axis, float halfAngle, inout uint s) {
+    return sampleSquareXi(axis, halfAngle, float2(rndf(s), rndf(s)));
 }
 
 // Sample a GGX visible-normal (VNDF, Heitz 2018) about geometric normal n for view ve, returning the
@@ -388,372 +468,11 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
 
-// ===== RIS emitter NEE =================================================================
-// Block emitters (torches, glowstone, lava, ...) get explicit NEE: per diffuse vertex, stream M uniform
-// candidates from the global light buffer through a weighted reservoir keyed by the UNSHADOWED target
-// p-hat = luminance(f * Le * G * area), then spend ONE shadow ray on the survivor. Sun/moon NEE stays
-// separate and additive. Lights are footprint bounding RECTANGLES (RtLightCollector): sampling a point
-// uniformly over the rectangle has pdf 1/area, so `area` rides the contribution like any area light.
-// Single-frame RIS only (no temporal reservoir reuse): DLSS-RR's own history already denoises this well
-// enough that a persistent per-pixel reservoir wasn't worth the added complexity and VRAM.
-// One resample serves three mutually exclusive receiver terms (see evalSampleContrib): front BRDF,
-// two-sided particle billboards, and LabPBR SSS backscatter from lights BEHIND the surface — all share
-// the reservoir and its single shadow ray, whose origin follows the survivor's side of the surface.
-
-// A reservoir in registers. pos/lnrm/le/area describe the chosen emitter sample; W is its unbiased
-// contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
-struct Reservoir {
-    float3 pos;  // light sample point (rebased world space)
-    float3 lnrm; // emitter outward normal
-    float3 le;   // emitter radiance
-    float area;  // emitter rectangle area (the area-light pdf factor)
-    float M;
-    float W;
-    float wSum;
-    float phat;
-};
-
-Reservoir resEmpty() {
-    Reservoir r;
-    r.pos = float3(0.0, 0.0, 0.0);
-    r.lnrm = float3(0.0, 0.0, 0.0);
-    r.le = float3(0.0, 0.0, 0.0);
-    r.area = 0.0;
-    r.M = 0.0;
-    r.W = 0.0;
-    r.wSum = 0.0;
-    r.phat = 0.0;
-    return r;
-}
-
-// Unshadowed contribution of a fixed light sample point at surface (hitPos,n,v); out p-hat = its
-// luminance (the resampling target). Evaluated from the UNBIASED hitPos — SURF_BIAS is applied only to
-// the shadow-ray origin in shadeReservoir, on whichever side the survivor sample lands. Three receiver
-// modes share one target function because they are mutually exclusive per candidate:
-//   - front hemisphere (ndl>0): the same Lambert(+GGX) BRDF split the sun NEE uses;
-//   - twoSided (particles): billboards have no back face, ndl=abs(ndl) folds both sides into the front;
-//   - back hemisphere with sss>0 (LabPBR leaves/grass): HG transmission phase — cosT = dot(wi,rd) peaks
-//     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
-float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
-                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough,
-                         bool twoSided, float sss, out float phat) {
-    phat = 0.0;
-    float3 toL = sp - hitPos;
-    float dist2 = dot(toL, toL);
-    if (dist2 < 1.0e-6) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    float dist = sqrt(dist2);
-    float3 wi = toL / dist;
-    float cosL = max(0.0, dot(lnrm, -wi));
-    if (cosL <= 0.0) {
-        return float3(0.0, 0.0, 0.0); // receiver behind the emitter face
-    }
-    float ndl = dot(n, wi);
-    if (twoSided) {
-        ndl = abs(ndl);
-    }
-    float3 contrib = float3(0.0, 0.0, 0.0);
-    if (ndl > 0.0) {
-        float G = ndl * cosL / dist2; // area-light geometry term (x area)
-        float3 brdf = diffAlb * INV_PI;
-        // twoSided callers are particle billboards, which pass rough=1/F0=0 and want diffuse-only
-        // shading: fresnelSchlick still returns up to full white at grazing angles even with F0=0 (that
-        // IS the Fresnel effect), so skipping the term here — not just zeroing F0 — is what keeps
-        // billboards from picking up a rim highlight they were never meant to have.
-        if (!twoSided) {
-            float3 h = normalize(wi + v);
-            float ndh = max(0.0, dot(n, h));
-            float ndv = max(1.0e-4, dot(n, v));
-            float vdh = max(0.0, dot(v, h));
-            float D = ggxD(ndh, rough);
-            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
-            float3 Fs = fresnelSchlick(vdh, F0);
-            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
-        }
-        contrib = brdf * le * (G * area);
-    } else if (sss > 0.0) {
-        float backNdl = -ndl;
-        float G = backNdl * cosL / dist2;
-        float cosT = dot(wi, rd);
-        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * le * (G * area);
-    }
-    phat = luminance(contrib);
-    return contrib;
-}
-
-// Select one light from the emitted-power distribution in O(1).
-void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
-    uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
-    if (pc.lightAliasAddr != 0) {
-        LightAlias a = ConstPtr<LightAlias>(pc.lightAliasAddr)[column];
-        bool self = aliasSample - float(column) < a.accept;
-        lightIndex = self ? column : a.aliasIndex;
-    } else {
-        lightIndex = column;
-    }
-}
-
-bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
-    cell.spanOffset = 0u;
-    cell.spanCount = 0u;
-    cell.invWeightSum = 0.0;
-    cellCoord = int3(0, 0, 0);
-    if (pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0) return false;
-    int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
-    if (coord.x < 0 || coord.y < 0 || coord.z < 0
-            || coord.x >= worldPush.lightGridDims.x
-            || coord.y >= worldPush.lightGridDims.y
-            || coord.z >= worldPush.lightGridDims.z) return false;
-    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
-            * uint(worldPush.lightGridDims.x) + uint(coord.x);
-    cell = ConstPtr<LightGridCell>(pc.lightGridCellAddr)[linear];
-    cellCoord = coord;
-    return cell.spanCount > 0u;
-}
-
-void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSeed,
-                        out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(lightCount);
-    uint column = min(uint(aliasSample), lightCount - 1u);
-    LightAlias alias = ConstPtr<LightAlias>(pc.lightLocalAliasAddr)[firstLight + column];
-    bool self = aliasSample - float(column) < alias.accept;
-    uint localIndex = self ? column : alias.aliasIndex;
-    lightIndex = firstLight + localIndex;
-}
-
-float unpackUnsignedFloat(uint bits, uint mantissaBits) {
-    uint mantissaMask = (1u << mantissaBits) - 1u;
-    uint mantissa = bits & mantissaMask;
-    uint exponent = (bits >> mantissaBits) & 31u;
-    if (exponent == 0u) {
-        return float(mantissa) * exp2(float(1 - 15 - int(mantissaBits)));
-    }
-    return (1.0 + float(mantissa) / float(1u << mantissaBits))
-            * exp2(float(int(exponent) - 15));
-}
-
-float3 lightRadiance(Light light) {
-    uint packed = light.le;
-    return float3(unpackUnsignedFloat(packed & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 11u) & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 22u) & 0x3ffu, 5u));
-}
-
-int3 lightSectionCoord(Light light) {
-    uint packed = light.section;
-    return int3(int(packed & 0x3ffu), int((packed >> 10u) & 0x3ffu),
-            int((packed >> 20u) & 0x3ffu));
-}
-
-// The half axes share three lanes two-at-a-time; see the Light record in world_common.
-float3 lightHalfU(Light light) {
-    return float3(unpackHalf2(light.halfUxy), unpackHalf2(light.halfUzVx).x);
-}
-
-float3 lightHalfV(Light light) {
-    return float3(unpackHalf2(light.halfUzVx).y, unpackHalf2(light.halfVyz));
-}
-
-// U x V drives both the emitter normal and the rectangle area, so it is computed once and shared.
-float3 lightCrossUV(Light light) {
-    return cross(lightHalfU(light), lightHalfV(light));
-}
-
-// The rect spans 2U x 2V, so its area is 4|U x V| — exactly the rectArea the collector used to store.
-float lightArea(Light light) {
-    return 4.0 * length(lightCrossUV(light));
-}
-
-float3 lightGeometricNormal(Light light) {
-    float3 normal = normalize(lightCrossUV(light));
-    return (light.section & 0x40000000u) != 0u ? -normal : normal;
-}
-
-float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
-                  float localProbability) {
-    float power = max(0.0, lightArea(light) * luminance(le));
-    float globalPdf = pc.lightAliasAddr != 0
-            ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
-    float localPdf = 0.0;
-    if (localProbability > 0.0 && power > 0.0) {
-        int3 delta = lightSectionCoord(light) - cellCoord;
-        if (all(abs(delta) <= int3(2, 2, 2))) {
-            float3 deltaF = float3(delta);
-            localPdf = power * cell.invWeightSum / max(1.0, dot(deltaF, deltaF));
-        }
-    }
-    return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
-}
-
-void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
-                              out uint lightIndex) {
-    ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(pc.lightGridSpanAddr);
-    float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
-    uint column = min(uint(aliasSample), cell.spanCount - 1u);
-    LightGridSpan span = spans[cell.spanOffset + column];
-    bool self = aliasSample - float(column) < span.accept;
-    uint firstLight = self ? span.firstLight : span.aliasFirstLight;
-    uint lightCount = self ? (span.packedLightCounts & 0xffffu)
-            : (span.packedLightCounts >> 16u);
-    selectSectionLight(firstLight, lightCount, proposalSeed, lightIndex);
-}
-
-// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
-// by emitted power and section distance, then its section-local power alias. Every light in
-// the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
-// Alias spans make weighted local selection O(1). The mixture PDF is reconstructed after the single
-// Light48 load: section power cancels with the section-local light PDF.
-void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
-                          out uint lightIndex) {
-    if (useLocal) {
-        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
-    } else {
-        selectGlobalLight(proposalSeed, lightIndex);
-    }
-}
-
-// ---- RIS cost budget. Both constants below come from a set of temporary probes that pinned the
-// candidate walk out of the shader to bound what memory-side RIS work could ever be worth. Against an
-// 18.0ms frame at M=8, removing every dependent load (span -> alias -> record) and all lane divergence
-// saved 5.9ms — a third of the frame. Split by vertex that was ~4.3ms at secondary vertices against
-// ~1.1ms at the primary hit, and forcing coherent selection recovered at most 1.3ms of it. So the cost
-// was chasing DEPTH, not divergence, and it lived at secondary vertices. The two knobs below spend that
-// finding; a presampled candidate pool would attack the same 5.9ms structurally, but see the note on
-// proposalSeed in tracePath for why it should share the pool rather than the seed.
-
-// Candidate-count divisor for RIS at secondary vertices (bounce > 0). Secondary vertices carried ~78% of
-// the cost while being much the more forgiving place to spend variance: that radiance is already
-// integrated over a diffuse lobe before the denoiser sees it. 18.0 -> 16.1ms, and indistinguishable from
-// 1 by eye — whereas reducing M globally to 2 was clearly worse, because that also degraded the primary
-// hit. The primary hit always keeps the full worldPush.risCandidates.
-//
-// 4 is the floor worth using rather than a tuning accident. The stratification below keeps at least one
-// global candidate, so M=2 is the smallest count that still schedules one local AND one global; at M=1
-// localProbability collapses to 0 and the light-grid proposal that makes nearby emitters sample well is
-// gone entirely.
-static const uint SECONDARY_RIS_DIVISOR = 4u;
-
-// Deepest SHADED surface at which RIS emitter NEE runs. Past it, emitters are gathered only when a path
-// hits one directly — the pre-RIS behaviour, still unbiased because gateEmitter lifts in lockstep, so the
-// failure mode is noisier emitter light at depth rather than missing light. Unlike the divisor this also
-// drops shadeReservoir's per-vertex shadow ray, which never scaled with M. Gating at all: 16.1 -> 15.7ms.
-//
-// This counts diffuseDepth, not `bounce`, and the difference is not cosmetic. MATERIAL_GLASS and
-// MATERIAL_WATER continue without shading anything, so looking through a pane spends bounce 0 on the
-// glass and lands the first shaded surface at bounce 1. Gating on `bounce` therefore starved surfaces
-// seen through glass or water — visually primary, but counted as depth — and they went black, since only
-// a path randomly striking an emitter could light them. Keying on shaded surfaces removes that whole
-// class of bug and lets the budget go lower than the two bounces of headroom the dielectric prefix used
-// to cost.
-//
-// Caveat this does not solve: a smooth specular bounce IS a shaded surface, so a wall seen in a metal
-// block counts as depth 1. Accumulated roughness rather than a vertex count is the principled fix, and
-// is what a radiance cache would need anyway to decide cache-vs-trace.
-static const uint RIS_MAX_DIFFUSE_DEPTH = 2u;
-
-// Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
-// sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
-Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool twoSided, float sss, uint shadedDepth,
-                     inout uint seed, inout uint proposalSeed) {
-    Reservoir r = resEmpty();
-    LightGridCell gridCell;
-    int3 gridCellCoord;
-    float3 gridLookup = hitPos;
-    if (pc.lightGridCellAddr != 0) {
-        // Stochastically blend across hard section boundaries. Every cell proposal retains full global
-        // support, so conditioning on this independently jittered lookup remains unbiased.
-        gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.lightGridOrigin.w;
-    }
-    bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    // shadedDepth, not the bounce index: a surface behind glass or water is the first thing this path has
-    // shaded and is visually primary, so it keeps the full candidate count.
-    uint candidateCount = shadedDepth == 0u
-            ? worldPush.risCandidates
-            : max(1u, worldPush.risCandidates / SECONDARY_RIS_DIVISOR);
-    // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
-    // local and two global candidates, with every lane taking the same branch for a given candidate.
-    // Counts that are not divisible by four use the nearest practical split with at least one global
-    // candidate; M=1 is global-only so the estimator retains full support.
-    uint globalCandidateCount = hasGridCell
-            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
-    uint localCandidateCount = candidateCount - globalCandidateCount;
-    float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < candidateCount; c++) {
-        r.M += 1.0;
-        uint li;
-        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
-        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
-        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        Light lg = ConstPtr<Light>(pc.lightBufAddr)[li];
-        // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
-        float s = rndf(seed) * 2.0 - 1.0;
-        float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.pos + worldPush.lightRebase.xyz
-                + s * lightHalfU(lg) + t * lightHalfV(lg);
-        float3 le = lightRadiance(lg);
-        float3 lightNormal = lightGeometricNormal(lg);
-        float area = lightArea(lg);
-        float phat;
-        evalSampleContrib(sp, lightNormal, le, area, hitPos, n, v, rd,
-                diffAlb, F0, rough, twoSided, sss, phat);
-        if (phat <= 0.0) {
-            continue;
-        }
-        float sourcePdf = proposalPdf(lg, le, gridCell, gridCellCoord, localProbability);
-        float w = phat / max(sourcePdf, 1.0e-20);
-        r.wSum += w;
-        if (rndf(seed) * r.wSum < w) { // weighted reservoir update
-            r.pos = sp;
-            r.lnrm = lightNormal;
-            r.le = le;
-            r.area = area;
-            r.phat = phat;
-        }
-    }
-    r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
-    return r;
-}
-
-// Shade a finalized reservoir: recompute the survivor's contribution at (hitPos,n,v), cast ONE shadow
-// ray, and return throughput-free radiance contrib*vis*W. The one ray serves whichever term fired for
-// the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
-// sample's side of the surface.
-float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, bool twoSided, float sss, out float3 vis) {
-    vis = float3(0.0, 0.0, 0.0);
-    if (s.W <= 0.0 || s.phat <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    float phat;
-    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, twoSided, sss, phat);
-    if (phat <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    // Pick the shadow-ray origin on the sample's side of the surface FIRST, then measure the ray from
-    // that origin — measuring dist from hitPos while tracing from the biased origin shifts the ray tip
-    // up to SURF_BIAS*ndl toward the emitter plane, beating the 0.001*dist stop-short margin for lights
-    // closer than ~SURF_BIAS/0.001 blocks -> shadow ray hits the emitter's own face -> per-texel black.
-    float side = dot(n, s.pos - hitPos) >= 0.0 ? 1.0 : -1.0;
-    float3 origin = hitPos + side * n * SURF_BIAS;
-    float3 toL = s.pos - origin;
-    float dist = length(toL);
-    // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
-    VisibilityResult shadow = visibility(origin, toL / dist, dist * 0.999);
-    vis = shadow.transmittance;
-    return contrib * vis * s.W;
-}
-
 // TLAS instance-mask bits (set on the Java side, ANDed against these per-ray cull masks):
 //   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
 //   bit 1 (0x02) — the primary camera ray.
-// Terrain / entities / block entities keep 0xFF (both bits). Particles use 0x02: primary-visible
-// receiver billboards only. The first-person camera owner uses 0x01 (secondary only).
+// Terrain / entities / block entities keep 0xFF (both bits). DH primary RT geometry uses 0x03. Particles
+// use 0x02: primary-visible receiver billboards only. The first-person owner uses 0x01 (secondary only).
 static const uint CULL_SECONDARY = 0x01u;
 static const uint CULL_PRIMARY = 0x02u;
 static const uint TERRAIN_BUCKETS = 4u;
@@ -770,79 +489,301 @@ RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
     return r;
 }
 
-// A radiance payload carrying only the two words the invoked hit/miss shader READS: `flags`
-// (show-celestial gate, consumed by world.rmiss) and the packed ray cone (consumed by world.rchit for
-// texture LOD). Every other member is an OUTPUT that world.rchit/world.rmiss write, so it carries no
-// information into a trace and is initialized to a neutral value here.
-Payload makeRadiancePayload(uint flags, uint rayCone) {
-    Payload p;
-    p.albedo = half3(0.0h, 0.0h, 0.0h);
-    p.normal = half3(0.0h, 0.0h, 0.0h);
-    p.hitT = -1.0; // miss sentinel: world.rmiss writes only albedo, so a miss leaves this negative
-    p.motionPrev = half3(0.0h, 0.0h, 0.0h);
-    p.f0 = half3(0.0h, 0.0h, 0.0h);
-    p.flags = flags;
-    p.roughMetal = 0u;
-    p.emissionSss = 0u;
-    p.iorTransmission = 0u;
-    p.rayCone = rayCone;
-    return p;
-}
-
 // SER radiance trace: trace into a hit object, reorder threads by hit coherence, THEN invoke the
 // hit/miss shader — this is where the divergent Section/Prim shading work (world.rchit/world.rahit)
 // actually happens, so reordering before it is what pays for the reorder's own cost.
-//
-// The payload is built TWICE from the trace state rather than carried across ReorderThread. Traversal
-// runs only world.rahit, which never writes a RADIANCE payload: its terrain tint paths live in the
-// translucent/water buckets, which carry no any-hit record for radiance rays, and its entity paths are
-// gated on RAY_FLAG_SKIP_CLOSEST_HIT_SHADER. So whatever TraceRay leaves in the payload holds no
-// information. Reading it back and carrying it over would pin all ten members — 72 bytes — in registers
-// across the one point where SER must spill every live value, which profiling showed to be the peak
-// live state in this shader. Rebuilding costs a few constant moves and leaves only these two words
-// spanning the reorder.
-void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
-                            bool showCelestial, float rayConeWidth, float rayConeSpread) {
-    uint flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
-    uint rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
-    Payload tracePayload = makeRadiancePayload(flags, rayCone);
+void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) {
     HitObject hObj = HitObject::TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
-            SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), tracePayload);
+            SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), payload);
     ReorderThread(hObj);
-    payload = makeRadiancePayload(flags, rayCone);
     HitObject::Invoke(topLevelAS, hObj, payload);
 }
 
-Payload makeShadowPayload() {
-    Payload shadowPayload;
-    shadowPayload.albedo = half3(1.0h, 1.0h, 1.0h);
-    shadowPayload.hitT = -1.0; // water-crossing sentinel, filled by the water any-hit
-    shadowPayload.normal = half3(0.0h, 0.0h, 0.0h);
-    shadowPayload.motionPrev = half3(0.0h, 0.0h, 0.0h);
-    shadowPayload.f0 = half3(0.0h, 0.0h, 0.0h);
-    shadowPayload.flags = 0u;
-    shadowPayload.roughMetal = 0u;
-    shadowPayload.emissionSss = 0u;
-    shadowPayload.iorTransmission = 0u;
-    shadowPayload.rayCone = 0u;
-    return shadowPayload;
-}
-
-VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
-    // Vulkan requires an identical payload structure for every stage reachable by this trace. The shadow
-    // path uses only albedo as accumulated transmittance and hitT as the nearest-water crossing.
-    Payload shadowPayload = makeShadowPayload();
+float3 visibility(float3 origin, float3 dir, float tmax) {
+    shadowVis = float4(1.0, 1.0, 1.0, -1.0); // a = water-crossing sentinel, filled by the water any-hit
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
-    // and water tint shadowPayload.albedo and pass through. Solid blocks terminate traversal. There is no
-    // closest or miss shader worth executing, so use a hit object only as the traversal result.
+    // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
+    // or miss shader worth executing, so use a hit object only as the traversal result.
     HitObject hObj = HitObject::TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
-            makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
-    VisibilityResult result;
-    result.transmittance = hObj.IsMiss() ? shadowPayload.albedo : float3(0.0, 0.0, 0.0);
-    result.waterHitT = shadowPayload.hitT;
-    return result;
+            makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
+    return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
+}
+
+// Surface BRDF shared by celestial NEE and local-light RIS. Keeping both paths identical prevents
+// point lights from looking like a separate raster/dynamic-lights effect and preserves LabPBR response.
+float3 evaluateSurfaceBrdf(float3 n, float3 v, float3 l, float3 diffAlb, float3 f0,
+                           float rough, bool pbr, float ndl) {
+    float3 brdf = diffAlb * INV_PI;
+    if (pbr) {
+        float3 h = normalize(l + v);
+        float ndh = max(0.0, dot(n, h));
+        float ndv = max(1.0e-4, dot(n, v));
+        float vdh = max(0.0, dot(v, h));
+        float D = ggxD(ndh, rough);
+        float G = ggxG1(ndv, rough) * ggxG1(max(ndl, 1.0e-4), rough);
+        float3 F = fresnelSchlick(vdh, f0);
+        brdf += (D * G) * F / (4.0 * ndv * max(ndl, 1.0e-4));
+    }
+    return brdf;
+}
+
+float pointLightAttenuation(float distanceSquared, float radius) {
+    float distanceToLight = sqrt(max(distanceSquared, 1.0e-6));
+    float range = clamp(1.0 - distanceToLight / max(radius, 0.25), 0.0, 1.0);
+    // Quartic window reaches exactly zero at the configured radius and avoids a visible light sphere.
+    float smoothWindow = range * range * (3.0 - 2.0 * range);
+    return (smoothWindow * smoothWindow) / max(distanceSquared, 0.20);
+}
+
+// Reservoir importance sampling over the compact local-light list. The target function is the
+// unshadowed luminance contribution, so one shadow ray is concentrated on the light that matters most
+// at this shading point. The totalWeight/selectedWeight factor is the exact categorical estimator;
+// unlike a nearest-light heuristic it remains unbiased for the represented point-light set.
+float3 sampleLocalPointLighting(float3 p, float3 n, float3 v, float3 diffAlb, float3 f0,
+                                float rough, bool pbr, inout uint seed) {
+    uint lightCount = min(worldPush.pointLightCount, 24u);
+    if (lightCount == 0u) return float3(0.0, 0.0, 0.0);
+
+    uint selected = 0xffffffffu;
+    float selectedWeight = 0.0;
+    float totalWeight = 0.0;
+    for (uint i = 0u; i < lightCount; ++i) {
+        PointLight light = worldPush.pointLights[i];
+        float3 toLight = light.positionRadius.xyz - p;
+        float distanceSquared = dot(toLight, toLight);
+        float radius = light.positionRadius.w;
+        if (distanceSquared <= 1.0e-6 || distanceSquared >= radius * radius) continue;
+        float invDistance = rsqrt(distanceSquared);
+        float3 l = toLight * invDistance;
+        float ndl = max(0.0, dot(n, l));
+        if (ndl <= 0.0) continue;
+        float attenuation = pointLightAttenuation(distanceSquared, radius);
+        float3 incident = max(light.radiance.rgb, float3(0.0, 0.0, 0.0))
+                * max(light.radiance.w, 0.0) * attenuation;
+        float3 estimate = evaluateSurfaceBrdf(n, v, l, diffAlb, f0, rough, pbr, ndl)
+                * incident * ndl;
+        float weight = max(luminance(estimate), 0.0);
+        if (weight <= 1.0e-8) continue;
+        totalWeight += weight;
+        if (rndf(seed) * totalWeight < weight) {
+            selected = i;
+            selectedWeight = weight;
+        }
+    }
+    if (selected == 0xffffffffu || selectedWeight <= 1.0e-8 || totalWeight <= 1.0e-8) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    PointLight light = worldPush.pointLights[selected];
+    float3 toLight = light.positionRadius.xyz - p;
+    float distanceSquared = max(dot(toLight, toLight), 1.0e-6);
+    float distanceToLight = sqrt(distanceSquared);
+    float3 l = toLight / distanceToLight;
+    float ndl = max(0.0, dot(n, l));
+    float attenuation = pointLightAttenuation(distanceSquared, light.positionRadius.w);
+    float3 incident = max(light.radiance.rgb, float3(0.0, 0.0, 0.0))
+            * max(light.radiance.w, 0.0) * attenuation;
+    float3 unshadowed = evaluateSurfaceBrdf(n, v, l, diffAlb, f0, rough, pbr, ndl)
+            * incident * ndl;
+    // Stop before entering the source proxy itself. Without this endpoint guard, a glowstone block or
+    // dropped-item mesh can occlude the analytic light located inside it and appear to emit no light.
+    float shadowDistance = distanceToLight - min(0.65, max(light.positionRadius.w * 0.045, 0.18));
+    float3 vis = shadowDistance > RAY_TMIN
+            ? visibility(p, l, shadowDistance) : float3(1.0, 1.0, 1.0);
+    return unshadowed * vis * (totalWeight / selectedWeight);
+}
+
+float3 fogVisibility(float3 origin, float3 dir, float tmax) {
+    // a < -1.5 marks a fog-lighting ray. The DH any-hit shader ignores coarse LOD geometry for this
+    // ray type: otherwise a low-detail skyscraper casts a giant blocky silhouette through the entire
+    // atmosphere. Nearby full-resolution terrain still produces soft volumetric occlusion.
+    shadowVis = float4(1.0, 1.0, 1.0, -2.0);
+    HitObject hObj = HitObject::TraceRay(topLevelAS,
+            RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
+            makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
+    return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
+}
+
+// Participating medium used for rain/thunder and for clear-air dawn/dusk haze.  The previous version
+// mixed coloured transmission from shadow rays directly into the fog and integrated a very strong HDR
+// sun term at sparse control points.  That produced large green/yellow blocks and occasional hot pixels.
+// This version uses scalar visibility, bounded single scattering, more frequent visibility control points
+// and low-amplitude world-space density variation.
+float henyeyGreenstein(float cosTheta, float g) {
+    float gg = g * g;
+    float denom = max(1.0 + gg - 2.0 * g * cosTheta, 1.0e-4);
+    return (1.0 - gg) / (4.0 * PI * denom * sqrt(denom));
+}
+
+float fogLuminance(float3 c) {
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// Very gentle, continuous modulation.  Large-amplitude noise reads as opaque blocks when multiplied by
+// hard sun visibility, so keep this close to one and let the shadow field create the visible shafts.
+float smoothFogDensity(float3 samplePos) {
+    float3 p = samplePos + float3(worldPush.waterAnchor.x, 0.0, worldPush.waterAnchor.y);
+    float n = 0.50 * sin(dot(p, float3(0.0117, 0.0071, 0.0093)) + 1.7)
+            + 0.30 * sin(dot(p, float3(-0.0069, 0.0137, 0.0047)) - 2.1)
+            + 0.20 * sin(dot(p, float3(0.0039, -0.0091, 0.0151)) + 0.4);
+    return clamp(0.985 + 0.025 * n, 0.95, 1.02);
+}
+
+float twilightFogFactor(float sunY) {
+    // Peak near the horizon, visible a little before sunrise and after sunset, then fade smoothly toward
+    // noon and full night.  abs(sunY) makes morning/evening symmetric.
+    float horizon = 1.0 - smoothstep(0.05, 0.46, abs(sunY));
+    float nightGate = smoothstep(-0.18, -0.015, sunY);
+    return clamp(horizon * nightGate, 0.0, 1.0);
+}
+
+float daytimeFogFactor(float sunY) {
+    // Unlike twilight haze, this stays present through the bright part of the day and fades before
+    // night. A smooth solar-elevation gate avoids a visible density switch at sunrise.
+    return smoothstep(0.02, 0.40, sunY);
+}
+
+float scalarFogVisibility(float3 samplePos, float3 lightDir) {
+    float3 transmitted = fogVisibility(samplePos, lightDir, 10000.0);
+    // Coloured glass/leaves may tint ordinary surface shadows, but feeding that RGB directly into a
+    // participating medium creates giant green panes in the air. Fog uses only scalar transmittance.
+    return clamp(fogLuminance(transmitted), 0.0, 1.0);
+}
+
+float3 fogDiskDirection(float3 axis, float2 diskOffset, float angularRadius) {
+    // Build a stable tangent frame around the celestial direction. The fallback only matters close to
+    // the pole where the celestial travel vector can become nearly parallel to the light direction.
+    float3 right = cross(axis, worldPush.celestial.xyz);
+    if (dot(right, right) < 1.0e-6) right = cross(axis, float3(0.0, 1.0, 0.0));
+    if (dot(right, right) < 1.0e-6) right = cross(axis, float3(1.0, 0.0, 0.0));
+    right = normalize(right);
+    float3 up = normalize(cross(right, axis));
+    return normalize(axis + angularRadius * (diskOffset.x * right + diskOffset.y * up));
+}
+
+float softFogVisibility(float3 samplePos, float3 lightDir, bool alternatePattern) {
+    // The near/far control points use complementary diagonal pairs. Together they still cover all four
+    // corners of the light disc, but each point needs only center + two penumbra rays instead of five.
+    // This cuts fog shadow traversal by 40% without reintroducing the old binary shaft edges.
+    float angularRadius = max(tan(max(worldPush.lightDir.w, 0.0)), 0.0030);
+    float center = scalarFogVisibility(samplePos, lightDir);
+    float2 diagonal = alternatePattern ? float2(0.72, -0.72) : float2(0.72, 0.72);
+    float pair = scalarFogVisibility(samplePos, fogDiskDirection(lightDir, diagonal, angularRadius));
+    pair += scalarFogVisibility(samplePos, fogDiskDirection(lightDir, -diagonal, angularRadius));
+    return clamp(center * 0.40 + pair * 0.30, 0.0, 1.0);
+}
+
+float rainSkyExposure(float3 surfacePos, float3 surfaceNormal) {
+    // A single vertical ray produced a binary, block-shaped dry stamp. Blend the centre ray with three
+    // short, outward-looking sky rays. Their fractional result makes wetness fade over roughly two
+    // blocks around roofs, overhangs and placed blocks instead of ending on a hard square boundary.
+    float3 origin = surfacePos + surfaceNormal * SURF_BIAS;
+    float centre = clamp(fogLuminance(visibility(origin, float3(0.0, 1.0, 0.0), 10000.0)), 0.0, 1.0);
+    const float SIDE = 0.16;
+    const float SIDE_HALF = 0.08;
+    const float SIDE_TRI = 0.13856407; // sqrt(3)/2 * SIDE
+    const float LOCAL_SKY_DISTANCE = 14.0;
+    // Three directions at 120 degrees keep the local aperture isotropic while saving one ray per wet
+    // primary hit compared with the old four-axis pattern.
+    float sides = 0.0;
+    sides += clamp(fogLuminance(visibility(origin,
+            normalize(float3(SIDE, 1.0, 0.0)), LOCAL_SKY_DISTANCE)), 0.0, 1.0);
+    sides += clamp(fogLuminance(visibility(origin,
+            normalize(float3(-SIDE_HALF, 1.0, SIDE_TRI)), LOCAL_SKY_DISTANCE)), 0.0, 1.0);
+    sides += clamp(fogLuminance(visibility(origin,
+            normalize(float3(-SIDE_HALF, 1.0, -SIDE_TRI)), LOCAL_SKY_DISTANCE)), 0.0, 1.0);
+    float aperture = centre * 0.58 + sides * 0.14;
+    return smoothstep(0.18, 0.88, aperture);
+}
+
+float fogStartDistance(float rain) {
+    // Keep a compact clean bubble around the player, then let the stronger atmosphere begin nearby.
+    // Rain pulls the transition closer without ever placing fog directly on the camera.
+    return lerp(18.0, 10.0, rain);
+}
+
+float fogRampDistance(float rain) {
+    return lerp(34.0, 21.0, rain);
+}
+
+float fogWeightedDistance(float distanceToSurface, float rain) {
+    float x = max(distanceToSurface - fogStartDistance(rain), 0.0);
+    float ramp = max(fogRampDistance(rain), 1.0e-3);
+    float u = clamp(x / ramp, 0.0, 1.0);
+    // Analytic integral of smoothstep(0,1,u): ramp * (u^3 - 0.5*u^4). Density and its slope are both
+    // zero at the clear-radius boundary, so the transition cannot read as a camera-centred sphere.
+    float smoothRampIntegral = ramp * (u * u * u - 0.5 * u * u * u * u);
+    return smoothRampIntegral + max(x - ramp, 0.0);
+}
+
+float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToSurface,
+                              float sigmaT, float fogAmount, float rain, float thunder,
+                              float twilight) {
+    float maxDistance = lerp(360.0, 480.0, rain);
+    float surfaceDistance = min(max(distanceToSurface, 0.0), maxDistance);
+    float fogStart = fogStartDistance(rain);
+    float marchDistance = max(surfaceDistance - fogStart, 0.0);
+    float opticalDistance = fogWeightedDistance(surfaceDistance, rain);
+    if (marchDistance <= 0.01 || opticalDistance <= 0.01 || sigmaT <= 1.0e-6) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float3 lightDir = normalize(worldPush.lightDir.xyz);
+    float anisotropy = lerp(0.30, 0.44, max(thunder, rain * 0.65));
+    float phaseRelative = clamp(henyeyGreenstein(
+            clamp(dot(rayDir, lightDir), -1.0, 1.0), anisotropy) * (4.0 * PI), 0.25, 2.35);
+
+    float3 rawLight = max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0));
+    float rawLightLum = fogLuminance(rawLight);
+    float3 lightColor = rawLightLum > 1.0e-5
+            ? rawLight / rawLightLum : float3(1.0, 1.0, 1.0);
+    float lightStrength = min(rawLightLum, 4.0);
+
+    // The old ray march evaluated a binary shadow at many discrete distances. Each distance projected a
+    // slightly different copy of the occluder into the fog, which appeared as the repeated skyscraper
+    // silhouettes in motion. Two soft, deterministic control points give one coherent shaft field and
+    // integrate the rest analytically, removing both depth bands and frame-to-frame blue-noise crawl.
+    float nearT = fogStart + marchDistance * 0.30;
+    float farT = fogStart + marchDistance * 0.72;
+    float3 nearPos = rayOrigin + rayDir * nearT;
+    float3 farPos = rayOrigin + rayDir * farT;
+    float nearVisibility = softFogVisibility(nearPos, lightDir, false);
+    float farVisibility = softFogVisibility(farPos, lightDir, true);
+    float distanceBlend = smoothstep(24.0, 150.0, marchDistance);
+    float rawVisibility = lerp(nearVisibility, nearVisibility * 0.42 + farVisibility * 0.58, distanceBlend);
+    // Atmospheric shafts should modulate the haze, not stamp binary building cut-outs into it.
+    // Keep shaft contrast broad and low-frequency. This prevents a single facade from becoming a
+    // dark cut-out while retaining local rays from full-resolution terrain.
+    float meanVisibility = lerp(1.0, smoothstep(0.06, 0.94, rawVisibility), 0.32);
+    // The same cloud volume that is visible in the miss shader also gates the light injected into fog.
+    float cloudVisibility = 0.5 * (cloudShadowTransmittance(nearPos, lightDir)
+            + cloudShadowTransmittance(farPos, lightDir));
+    meanVisibility *= cloudVisibility;
+    float meanDensity = lerp(smoothFogDensity(nearPos), smoothFogDensity(farPos), 0.58);
+
+    float totalExtinction = 1.0 - exp(-sigmaT * opticalDistance * meanDensity);
+    float directScale = lightStrength * 0.038 * phaseRelative * meanVisibility
+            * lerp(0.55, 1.0, fogAmount);
+    float3 direct = lightColor * directScale * totalExtinction;
+    // Keep the low-frequency shaft contribution below the energy removed from the view ray, especially
+    // around a low sun where the path-tracer light value is intentionally very bright.
+    float3 directLimit = lightColor * (0.075 + 0.11 * rain) * totalExtinction;
+    direct = min(max(direct, float3(0.0, 0.0, 0.0)), directLimit);
+
+    float3 rainAmbient = lerp(float3(0.24, 0.29, 0.36), float3(0.08, 0.09, 0.12), thunder);
+    float3 twilightAmbient = float3(0.34, 0.22, 0.15);
+    float twilightWeight = twilight * (1.0 - rain);
+    float3 ambientColor = lerp(rainAmbient, twilightAmbient, twilightWeight);
+    float clearDayWeight = daytimeFogFactor(worldPush.sunDir.y) * (1.0 - rain);
+    // Day haze must add skylight as well as extinction; otherwise stronger fog merely darkens distance
+    // and remains visually indistinct against shaded terrain.
+    ambientColor = lerp(ambientColor, float3(0.38, 0.47, 0.60), 0.65 * clearDayWeight);
+    float ambientStrength = 0.13 + 0.11 * fogAmount + 0.05 * twilightWeight
+            + 0.07 * clearDayWeight;
+    return direct + ambientColor * totalExtinction * ambientStrength;
 }
 
 float2 projectPrevNdc(float3 worldPos) {
@@ -883,10 +824,11 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
     // lies in the screen plane there) -> a non-zero MV in a static scene. Reconstructing from surfacePos
     // cancels the term so the mirror lands exactly on the view ray (static MV = bit-exact zero) WITHOUT
     // zeroing the trace bias the main path tracer needs to avoid surface acne.
-    traceRadianceReordered(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0,
-            false,
+    payload.hitT = -1.0;
+    payloadSetTraceState(false,
             max(length(surfacePos - worldPush.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
+    traceRadianceReordered(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0);
 
     float3 reflectedHit;
     float3 reflectedMotionPrev;
@@ -930,8 +872,9 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     refracted = true;
 
     float3 ro = surfacePos - surfaceNormal * SURF_BIAS;
-    traceRadianceReordered(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0,
-            false, rayConeWidth, rayConeSpread);
+    payload.hitT = -1.0;
+    payloadSetTraceState(false, rayConeWidth, rayConeSpread);
+    traceRadianceReordered(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0);
     if (payload.hitT < 0.0) {
         hitCamRel = (ro + refractedDir * 1.0e6) - worldPush.camOffset; // sky through the surface, at infinity
         motionPrev = float3(0.0, 0.0, 0.0);
@@ -945,33 +888,34 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     uint material = payloadMaterial();
     motionPrev = material != MATERIAL_WATER ? payload.motionPrev : float3(0.0, 0.0, 0.0);
     if (material == MATERIAL_OPAQUE) {
-        diffuseAlbedo = payload.albedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0));
-        float3 f0 = payload.f0;
-        float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
-        float NoV = clamp(dot(payload.normal, -refractedDir), 0.0, 1.0);
-        specAlbedo = rrSpecularAlbedo(f0, rough * rough, NoV);
+        bool pbr = (worldPush.flags & 2u) != 0u;
+        diffuseAlbedo = pbr ? payload.albedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0)) : payload.albedo;
+        if (pbr) {
+            float3 f0 = payload.f0;
+            float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
+            float NoV = clamp(dot(payload.normal, -refractedDir), 0.0, 1.0);
+            specAlbedo = rrSpecularAlbedo(f0, rough * rough, NoV);
+        }
     }
 }
 
 // One Monte Carlo path from (ro, rd). Returns accumulated radiance along the path.
-float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint sampleIndex,
-                 inout uint seed) {
+// NRD's radiance alpha is not primary depth: it is the distance to the first *indirect* hit.
+// Keeping it alongside the sampled path lets RELAX preserve edges rather than treating an entire
+// foreground surface as one long, low-frequency signal.
+float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
+                 out float firstIndirectHitDistance) {
+    firstIndirectHitDistance = 0.0;
+    gv_historyStable = false;
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
     float rayConeWidth = 0.0;
     float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
-    int maxBounces = int(worldPush.maxBounces);
+    // 0 is Progressive Infinite. A literal infinite shader loop would hang the GPU; Russian Roulette
+    // makes this an unbiased open-ended path, with 64 only as a catastrophic safety guard.
+    int maxBounces = worldPush.maxBounces == 0u ? 64 : min(int(worldPush.maxBounces), 64);
     int rrStart = maxBounces <= 3 ? 1 : 2;
-    // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
-    // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
-    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && pc.lightBufAddr != 0;
-    // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
-    // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
-    // Measured: making a 16x16 tile share this seed recovers at most 1.3ms, so a future pool should share
-    // the POOL rather than the seed — the win is in removing dependent loads, not in coherence.
-    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
-            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
-    proposalSeed = pcg(proposalSeed);
+    bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
     // and absorption when the eye is underwater.
     bool inWater = (worldPush.flags & 1u) != 0u;
@@ -984,18 +928,14 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     // diffuse-sampled continuation rays — those are already covered by the sun NEE, so the tiny disc
     // would be a double-counted firefly. Reset true on every specular/water bounce, false on a diffuse one.
     bool showCelestial = true;
-    // Number of surfaces this path has SHADED so far, as distinct from `bounce`, which also counts
-    // dielectric interfaces. Glass and water continue without shading anything, so a wall behind a pane
-    // is bounce 1 but diffuseDepth 0 — visually primary, and it must be treated as such. See
-    // RIS_MAX_DIFFUSE_DEPTH.
-    int diffuseDepth = 0;
     for (int bounce = 0; bounce <= maxBounces; bounce++) {
+        payload.hitT = -1.0;
+        payloadSetTraceState(showCelestial, rayConeWidth, rayConeSpread);
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
-        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
-                showCelestial, rayConeWidth, rayConeSpread);
+        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0);
 
         if (payload.hitT < 0.0) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into payload.albedo. The
@@ -1011,10 +951,17 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 gv_rough = 1.0;
                 gv_emission = 0.0;
                 gv_emissionSource = EMISSION_SOURCE_NONE;
-                gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
-                gv_motionHitCamRel = gv_hitCamRel;
+                gv_hitCamRel = rd * 1.0e6; // sky depth remains at infinity
+                float cloudGuideDistance = payload.motionPrev.x;
+                // Opaque cloud pixels reproject at their optical centroid, so camera translation gives
+                // them finite parallax instead of treating the moving world-anchored volume as a star.
+                gv_motionHitCamRel = cloudGuideDistance > 0.0
+                        ? (ro + rd * cloudGuideDistance - worldPush.camOffset) : gv_hitCamRel;
                 gv_motionUseRefracted = false;
-                gv_motionObjDisp = float3(0.0, 0.0, 0.0); // sky is static
+                float2 cloudWindDelta = cloudWindWorld(worldPush.waterAnchor.w);
+                gv_motionObjDisp = cloudGuideDistance > 0.0
+                        ? float3(cloudWindDelta.x, 0.0, cloudWindDelta.y)
+                        : float3(0.0, 0.0, 0.0);
             }
             L += throughput * sky; // escaped to sky
             break;
@@ -1027,6 +974,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             throughput *= exp(-waterExt * payload.hitT);
         }
 
+        // The first traced surface after the primary hit is NRD's in-lobe hit distance. A miss
+        // remains 0, as required by RELAX; do not substitute the primary camera depth here.
+        if (bounce == 1) {
+            firstIndirectHitDistance = max(payload.hitT, 0.0);
+        }
+
         float3 n = payload.normal; // oriented toward the incoming ray by the closest-hit
         float3 hitPos = ro + rd * payload.hitT;
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
@@ -1034,6 +987,8 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         if (bounce == 0) {
             gv_emission = payloadEmission();
             gv_emissionSource = payloadEmissionSource();
+            gv_historyStable = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) == 0u
+                    && material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
         }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
@@ -1043,7 +998,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // refraction bend) — the instance stays double-sided and the normal already faces the incoming ray.
         if (material == MATERIAL_GLASS) {
             float3 glassTint = payload.albedo;
-            float materialIor = max(payloadIor(), 1.0e-3);
+            // Emissive transparent DH materials (for example glowing resource-pack panes/cutouts) retain
+            // their dielectric continuation but still contribute their baked colour as radiance.
+            float glassEmission = payloadEmission();
+            if (glassEmission > 0.0) {
+                L += throughput * glassTint * glassEmission * EMISSIVE_STRENGTH;
+            }
+            float packedIor = payloadIor();
+            bool thinDhGlass = packedIor < 0.0;
+            float materialIor = max(abs(packedIor), 1.0e-3);
             float transmission = clamp(payloadTransmission(), 0.0, 1.0);
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             float F = fresnelDielectric(cosI, 1.0, materialIor);
@@ -1058,11 +1021,25 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 gv_motionObjDisp = payload.motionPrev; // 0 for static terrain
             }
             if (rndf(seed) < F) {
+                // Specular reflection (Fresnel glint)
                 rd = reflect(rd, n);
                 ro = hitPos + n * SURF_BIAS;       // reflected ray stays on the incidence side
             } else {
-                throughput *= glassTint * transmission; // colored, optionally partial transmission
-                ro = hitPos - n * GLASS_TRANSMIT_BIAS; // cross to the far side without overshooting a close neighbour
+                // DH exposes only a coarse surface mesh, not a reliable watertight glass volume. Its
+                // negative IOR tag therefore selects thin transmission: retain direction and tint the
+                // ray. Native glass keeps the volumetric Snell path.
+                float eta = 1.0 / materialIor;
+                float3 refracted = thinDhGlass ? rd : refract(rd, n, eta);
+                if (dot(refracted, refracted) <= 0.0) {
+                    // Total internal reflection (shouldn't happen entering glass from air,
+                    // but handles edge cases when n is perturbed by normal maps).
+                    rd = reflect(rd, n);
+                    ro = hitPos + n * SURF_BIAS;
+                } else {
+                    rd = normalize(refracted);
+                    throughput *= glassTint * transmission; // colored, optionally partial transmission
+                    ro = hitPos - n * GLASS_TRANSMIT_BIAS; // cross to the far side without overshooting a close neighbour
+                }
             }
             showCelestial = true;                  // specular interface: the continuation ray may see the disc
             if (bounce >= rrStart) {
@@ -1101,22 +1078,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             float ndl = abs(signedNdl);
             if (ndl > 0.0) {
                 float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
-                float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                float3 vis = visibility(shadowOrigin, lightDir, 10000.0);
                 if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                    L += throughput * albedo * INV_PI * worldPush.lightRadiance.xyz * ndl * vis;
+                    L += throughput * albedo * INV_PI * worldPush.lightRadiance.xyz * ndl * vis
+                            * cloudShadowTransmittance(hitPos, lightDir);
                 }
-            }
-
-            // RIS direct lighting from block emitters (lava, glowstone, torches, ...) — same reservoir
-            // sampler as terrain/entities, but two-sided: a billboard has no back face, so light
-            // striking either side of the quad should still land (matches the sun/moon NEE above).
-            if (risOn && diffuseDepth <= int(RIS_MAX_DIFFUSE_DEPTH)) {
-                float3 v = -rd;
-                Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                        true, 0.0, uint(diffuseDepth), seed, proposalSeed);
-                float3 risVis;
-                L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                        true, 0.0, risVis);
             }
 
             if (bounce >= maxBounces) {
@@ -1127,7 +1093,6 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
-            diffuseDepth++;        // a billboard is a shaded surface, unlike the dielectric branches
             continue;
         }
 
@@ -1200,17 +1165,54 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         float3 v = -rd; // view direction (toward the camera / incoming ray)
 
         // Material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a fixed
-        // 0.04 F0, sourced from the chit (LabPBR custom/metal F0, or the dielectric default it applies).
-        float rough = clamp(payloadRoughness(), MIN_ROUGH, 1.0);
-        float metal = clamp(payloadMetalness(), 0.0, 1.0);
+        // 0.04 F0. With PBR disabled this collapses to the Lambertian fallback.
+        float rough = pbr ? clamp(payloadRoughness(), MIN_ROUGH, 1.0) : 1.0;
+        float metal = pbr ? clamp(payloadMetalness(), 0.0, 1.0) : 0.0;
         float3 diffAlb = albedo * (1.0 - metal);
-        float3 F0 = payload.f0;
+        // F0 comes from the chit: dielectric 0.04, a LabPBR custom/metal F0, or albedo for metals.
+        float3 F0 = pbr ? payload.f0 : lerp(float3(0.04, 0.04, 0.04), albedo, metal);
+
+        // Rain wetness: only upward-facing primary surfaces with access to the sky get a water film.
+        // Puddle placement is world-stable and independent of block boundaries. Local sky exposure is
+        // fractional, so roofs and placed blocks create a soft drying gradient rather than a hard square.
+        float rainAmount = clamp(worldPush.weather.x, 0.0, 1.0);
+        if (pbr && bounce == 0 && rainAmount > 0.001 && n.y > 0.15) {
+            float openSky = rainSkyExposure(hitPos, n);
+            float upward = smoothstep(0.15, 0.75, n.y);
+            float flatness = smoothstep(0.72, 0.96, n.y);
+            float exposure = rainAmount * openSky;
+
+            // Rain fills the same world-stable drainage basins from their deepest centres outward.
+            // The wider transition keeps shores soft and lets separate pools merge naturally in heavy rain.
+            float2 puddleXZ = hitPos.xz + worldPush.waterAnchor.xy;
+            float field = puddleField(puddleXZ);
+            float fillThreshold = lerp(0.76, 0.46, rainAmount);
+            float basinDepth = saturate((field - fillThreshold) / max(1.0 - fillThreshold, 1.0e-3));
+            float shore = smoothstep(fillThreshold - 0.12, fillThreshold + 0.10, field);
+            float puddle = exposure * flatness * shore;
+            float deepWater = puddle * smoothstep(0.08, 0.62, basinDepth);
+            float film = exposure * upward * lerp(0.10, 0.20, flatness) * (1.0 - 0.45 * puddle);
+
+            // Shallow edges retain some roughness and colour; the deepest basin is the smoothest and
+            // darkest, creating a gradual wet-soil -> standing-water transition.
+            diffAlb *= lerp(1.0, 0.91, film);
+            diffAlb *= lerp(1.0, 0.79, puddle);
+            diffAlb *= lerp(1.0, 0.88, deepWater);
+            rough = lerp(rough, 0.42, film);
+            rough = lerp(rough, 0.16, puddle);
+            rough = lerp(rough, 0.055, deepWater);
+            if (metal < 0.5) {
+                F0 = lerp(F0, float3(0.048, 0.048, 0.048), film);
+                F0 = lerp(F0, float3(0.060, 0.060, 0.060), puddle);
+                F0 = lerp(F0, float3(0.072, 0.072, 0.072), deepWater);
+            }
+        }
 
         if (bounce == 0) { // primary-visibility surface: capture the denoiser guide buffers
             gv_normal = n;
-            gv_albedo = diffAlb;  // RR diffuse-albedo demodulation target
+            gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
             gv_rough = rough;
-            gv_specAlb = rrSpecularAlbedo(F0, rough * rough, dot(n, v));
+            gv_specAlb = pbr ? rrSpecularAlbedo(F0, rough * rough, dot(n, v)) : float3(0.0, 0.0, 0.0);
             gv_hitCamRel = ro + rd * payload.hitT - worldPush.camOffset; // camera-relative hit position
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
@@ -1218,72 +1220,56 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
-        // RIS emitter NEE: the direct-hit emission term is gated only for emitters RIS actually samples
-        // (payload emitter-in-list bit) — and then only off diffuse continuation rays (showCelestial
-        // false), which the previous vertex's RIS already accounted for; the primary ray and
-        // specular/dielectric bounces (showCelestial true) still add it, since no emitter NEE happened
-        // along those. Emitters NOT in the light buffer (sparse/sub-threshold footprints, entities) are
-        // never NEE-sampled, so they always gather — bit-identical to the no-NEE path, no energy lost.
-        // Emission is already the full HDR strength (EMISSIVE_STRENGTH baseline * any override
-        // multiplier baked in Java at material-compile time — see MaterialHeader.features packing).
+        // Nearby emitters also participate in the analytic local-light reservoir below; direct visibility
+        // handles their surface-to-receiver contribution while this term preserves visible/self-emission
+        // and indirect paths that actually strike the emissive geometry.
         float emission = payloadEmission();
-        // One gate drives both the RIS call below and the direct-hit emission suppression here. They must
-        // agree: gateEmitter exists only because RIS already accounted for this emitter, so a bounce where
-        // RIS is skipped must also gather emission directly or that light is lost outright.
-        bool risActive = risOn && diffuseDepth <= int(RIS_MAX_DIFFUSE_DEPTH);
-        bool gateEmitter = risActive && payloadEmitterInList();
-        if (emission > 0.0 && (!gateEmitter || showCelestial)) {
-            L += throughput * albedo * emission;
+        if (emission > 0.0) {
+            L += throughput * albedo * emission * EMISSIVE_STRENGTH;
         }
 
-        // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert
-        // diffuse + GGX specular, one shadow ray. Jitter the light direction within its square angular
-        // extent (worldPush.lightDir.w half-angle) so the shadow ray samples the light's quad — soft penumbrae
-        // over accumulation. The same sampled direction drives ndl, the shadow ray, and the specular
-        // half-vector.
-        float3 lightDir = worldPush.lightDir.xyz;
+        // NEE: direct light from the dominant celestial body. Primary hits use an antithetic pair on
+        // the square sun/moon emitter: the second point mirrors the first across the light centre. This
+        // spends one extra primary shadow ray but cancels much of the one-sample soft-shadow noise.
+        float3 lightDir = normalize(worldPush.lightDir.xyz); // centre direction, also used by SSS below
         float lightHalfAngle = worldPush.lightDir.w;
-        if (lightHalfAngle > 0.0) {
-            lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
-        }
-        float ndl = max(0.0, dot(n, lightDir));
-        if (ndl > 0.0) {
-            VisibilityResult shadow = visibility(p, lightDir, 10000.0);
-            float3 vis = shadow.transmittance;
+        int celestialSamples = bounce == 0 && lightHalfAngle > 0.0 ? 2 : 1;
+        float2 celestialXi = float2(rndf(seed), rndf(seed));
+        float3 celestialDirect = float3(0.0, 0.0, 0.0);
+        for (int lightSample = 0; lightSample < celestialSamples; ++lightSample) {
+            float3 sampledLightDir = lightDir;
+            if (lightHalfAngle > 0.0) {
+                float2 xi = lightSample == 0 ? celestialXi : (1.0 - celestialXi);
+                sampledLightDir = sampleSquareXi(lightDir, lightHalfAngle, xi);
+            }
+            float ndl = max(0.0, dot(n, sampledLightDir));
+            if (ndl <= 0.0) continue;
+            float3 vis = visibility(p, sampledLightDir, 10000.0);
+            vis *= cloudShadowTransmittance(hitPos, sampledLightDir);
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
-            // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
-            // so it applies to the whole NEE term (diffuse + specular).
-            if (inWater && waterWaves && shadow.waterHitT > 0.0) {
-                vis *= waterCaustic(p + lightDir * shadow.waterHitT, lightDir, shadow.waterHitT);
+            // the wave-refraction caustic at the exit point. Focusing scales incident irradiance.
+            if (inWater && waterWaves && shadowVis.a > 0.0) {
+                vis *= waterCaustic(p + sampledLightDir * shadowVis.a,
+                        sampledLightDir, shadowVis.a);
             }
-            if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                float3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
-                float3 h = normalize(lightDir + v);
-                float ndh = max(0.0, dot(n, h));
-                float ndv = max(1.0e-4, dot(n, v));
-                float vdh = max(0.0, dot(v, h));
-                float D = ggxD(ndh, rough);
-                float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
-                float3 F = fresnelSchlick(vdh, F0);
-                brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
-                L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
-            }
+            if (max(vis.r, max(vis.g, vis.b)) <= 0.0) continue;
+            float3 brdf = evaluateSurfaceBrdf(n, v, sampledLightDir, diffAlb, F0,
+                    rough, pbr, ndl);
+            celestialDirect += brdf * worldPush.lightRadiance.xyz * ndl * vis;
         }
+        L += throughput * (celestialDirect / float(celestialSamples));
 
-        // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
-        // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
-        // only be in front of n or behind it, never both, so combining them into one target function is
-        // exact, not an approximation. The SSS term is gated off past MAX_SSS_DIFFUSE_DEPTH by passing
-        // sss=0 there (falls back to plain front-only RIS). Keyed on diffuseDepth, not `bounce`, for the
-        // same reason as RIS_MAX_DIFFUSE_DEPTH above: leaves seen through a window are still the first
-        // surface this path has shaded, and should still backlight.
-        if (risActive) {
-            float activeSss = diffuseDepth <= MAX_SSS_DIFFUSE_DEPTH ? sss : 0.0;
-            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
-                    uint(diffuseDepth), seed, proposalSeed);
-            float3 risVis;
-            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
-                    activeSss, risVis);
+        // Local emissive NEE. Placed luminous blocks, held items and dropped items are represented as a
+        // compact analytic point-light set. A ReSTIR-style weighted reservoir chooses one significant
+        // light and evaluates exactly one visibility ray, replacing the extremely noisy strategy of
+        // waiting for a random GI path to hit a tiny torch or item mesh.
+        if (bounce <= 1 && worldPush.pointLightCount > 0u) {
+            int localSamples = bounce == 0 ? 2 : 1;
+            float3 localDirect = float3(0.0, 0.0, 0.0);
+            for (int localSample = 0; localSample < localSamples; ++localSample) {
+                localDirect += sampleLocalPointLighting(p, n, v, diffAlb, F0, rough, pbr, seed);
+            }
+            L += throughput * (localDirect / float(localSamples));
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -1291,16 +1277,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // through them toward the light source). Shadow ray fires from the back face to avoid
         // self-occlusion. cosT = dot(lightDir, rd): rd tracks the ray toward the sun when the sun is
         // behind the slab, giving cosT ≈ 1 → forward-scatter peak.
-        if (sss > 0.0 && diffuseDepth <= MAX_SSS_DIFFUSE_DEPTH) {
+        if (sss > 0.0 && bounce <= MAX_SSS_BOUNCE) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
-                VisibilityResult shadowBack = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
-                float3 visB = shadowBack.transmittance;
+                float3 visB = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
+                visB *= cloudShadowTransmittance(hitPos, lightDir);
                 // Same caustic as the front-face NEE — underwater kelp/seagrass transmission should
                 // flicker with the same light bands as the floor around it.
-                if (inWater && waterWaves && shadowBack.waterHitT > 0.0) {
-                    visB *= waterCaustic(hitPos + lightDir * shadowBack.waterHitT,
-                            lightDir, shadowBack.waterHitT);
+                if (inWater && waterWaves && shadowVis.a > 0.0) {
+                    visB *= waterCaustic(hitPos + lightDir * shadowVis.a, lightDir, shadowVis.a);
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
@@ -1309,34 +1294,37 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             }
         }
 
-        // Every shading term for this surface is now accounted for, so it counts toward the shaded depth.
-        // The dielectric branches above return before reaching here, which is exactly the distinction
-        // between this and `bounce`.
-        diffuseDepth++;
-
         // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe, chosen by their
-        // relative reflectance.
-        float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
-        if (rndf(seed) < ps) {
-            float3 h = sampleGGXVNDF(n, v, rough, seed);
-            float3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
-            float ndl2 = dot(n, l);
-            if (ndl2 <= 0.0) {
-                break; // microfacet reflects below the surface: terminate this path
+        // relative reflectance. With PBR off, use the cosine-weighted Lambertian fallback.
+        if (pbr) {
+            float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
+            if (rndf(seed) < ps) {
+                float3 h = sampleGGXVNDF(n, v, rough, seed);
+                float3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
+                float ndl2 = dot(n, l);
+                if (ndl2 <= 0.0) {
+                    break; // microfacet reflects below the surface: terminate this path
+                }
+                // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
+                float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
+                throughput *= F * ggxG1(ndl2, rough) / ps;
+                ro = p;
+                rd = l;
+                rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
+                showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
+            } else {
+                throughput *= diffAlb / (1.0 - ps);
+                ro = p;
+                rd = cosineDir(n, seed);
+                rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+                showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
             }
-            // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
-            float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
-            throughput *= F * ggxG1(ndl2, rough) / ps;
-            ro = p;
-            rd = l;
-            rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
-            showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
         } else {
-            throughput *= diffAlb / (1.0 - ps);
+            throughput *= albedo; // Lambertian fallback (PI and cos cancel)
+            showCelestial = false; // diffuse bounce: hide the disc (covered by NEE)
             ro = p;
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
-            showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
         }
 
         // Russian roulette on deeper bounces: survive with prob = max channel, rescale survivors.
@@ -1351,11 +1339,75 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     return L;
 }
 
+int2 interlacedTileSize(uint divisor) {
+    if (divisor <= 1u) return int2(1, 1);
+    if (divisor == 4u) return int2(2, 2);
+    if (divisor == 8u) return int2(4, 2);
+    return int2(4, 4);
+}
+
+int2 interlacedPhaseFromIndex(uint divisor, uint index) {
+    if (divisor <= 1u) return int2(0, 0);
+    if (divisor == 4u) return int2(int(index & 1u), int((index >> 1u) & 1u));
+    if (divisor == 8u) return int2(int(index & 3u), int((index >> 2u) & 1u));
+    return int2(int(index & 3u), int((index >> 2u) & 3u));
+}
+
+uint stableInterlacedPhaseIndex(uint divisor, int2 tileCoord) {
+    uint tx = uint(max(tileCoord.x, 0));
+    uint ty = uint(max(tileCoord.y, 0));
+    if (divisor <= 1u) return 0u;
+    if (divisor == 4u) {
+        // Static diagonal checkerboard across 2x2 tiles: adjacent tiles pick opposite corners.
+        return (((tx ^ ty) & 1u) == 0u) ? 0u : 3u;
+    }
+    if (divisor == 8u) {
+        // A stable sparse checkerboard/dither across 4x2 tiles.
+        return ((tx * 5u) ^ (ty * 3u)) & 7u;
+    }
+    return ((tx * 5u) + (ty * 7u)) & 15u;
+}
+
+int2 interlacedPhase(uint divisor, uint frameIndex, int2 tileCoord, bool jitterEnabled) {
+    uint idx = stableInterlacedPhaseIndex(divisor, tileCoord);
+    if (jitterEnabled) {
+        idx = (idx + frameIndex) & (divisor - 1u);
+    }
+    return interlacedPhaseFromIndex(divisor, idx);
+}
+
 [shader("raygeneration")]
 void main() {
     worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0]; // load the per-frame push data from the BDA buffer
-    int2 pix = int2(DispatchRaysIndex().xy);
-    float2 size = float2(DispatchRaysDimensions().xy);
+
+    // debugView's low byte remains the user-facing debug mode. The next byte carries the Ray Budget
+    // divisor without expanding the established push-constant ABI used by every RT stage.
+    uint debugMode = pc.debugView & 0xffu;
+    uint rayBudgetDivisor = (pc.debugView >> 8u) & 0xffu;
+    bool rayBudgetJitter = ((pc.debugView >> 16u) & 1u) != 0u;
+    rayBudgetDivisor = rayBudgetDivisor <= 1u ? 1u
+            : rayBudgetDivisor <= 2u ? 2u
+            : rayBudgetDivisor <= 4u ? 4u
+            : rayBudgetDivisor <= 8u ? 8u : 16u;
+
+    uint fullWidth;
+    uint fullHeight;
+    outImage.GetDimensions(fullWidth, fullHeight);
+    int2 fullSize = int2(int(fullWidth), int(fullHeight));
+    int2 launch = int2(DispatchRaysIndex().xy);
+    int2 pix;
+    if (rayBudgetDivisor == 2u) {
+        uint checkerParity = uint(launch.x) & 1u;
+        if (rayBudgetJitter) checkerParity ^= (pc.frameIndex & 1u);
+        int checkerY = launch.y * 2 + int(checkerParity);
+        pix = int2(launch.x, min(checkerY, fullSize.y - 1));
+    } else {
+        int2 tileSize = interlacedTileSize(rayBudgetDivisor);
+        int2 tileOrigin = launch * tileSize;
+        pix = min(tileOrigin + interlacedPhase(rayBudgetDivisor, pc.frameIndex, launch, rayBudgetJitter),
+                fullSize - int2(1, 1));
+    }
+    float2 size = float2(fullSize);
     float2 uv = (float2(pix) + 0.5) / size;
     float2 ndc = uv * 2.0 - 1.0; // unjittered pixel centre — the motion vector reprojects this
 
@@ -1375,14 +1427,47 @@ void main() {
     float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
 
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (worldPush.frameIndex * 2654435761u);
+    // Blue-noise spatial decorrelation: XOR a blue-noise sample into the seed so
+    // neighbouring pixels have uncorrelated random sequences within each frame.
+    float bn = blueNoiseRand(pix, worldPush.frameIndex);
+    seed ^= uint(bn * 4294967295.0);
 
     uint spp = max(worldPush.spp, 1u);
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
+    float nrdHitDistance = 0.0;
     for (uint s = 0u; s < spp; s++) {
         seed = pcg(seed); // decorrelate per-sample paths (shared camera ray, no AA jitter yet)
-        frameRadiance += tracePath(origin, dir, rayConeSpread, uint2(pix), s, seed);
+        float sampleNrdHitDistance;
+        frameRadiance += tracePath(origin, dir, rayConeSpread, seed, sampleNrdHitDistance);
+        nrdHitDistance += sampleNrdHitDistance;
     }
     frameRadiance /= float(spp);
+    nrdHitDistance /= float(spp);
+
+    // Volumetric atmosphere is always present.  Clear weather keeps a light baseline haze at every
+    // time of day; dawn/dusk, rain and thunder smoothly strengthen it without abrupt weather switches.
+    // Debug views still bypass this below.
+    float rain = clamp(worldPush.weather.x, 0.0, 1.0);
+    float thunder = clamp(worldPush.weather.y, 0.0, 1.0);
+    float twilight = twilightFogFactor(worldPush.sunDir.y);
+    float dayHaze = daytimeFogFactor(worldPush.sunDir.y);
+    float clearFogAmount = clamp(0.88 + 0.10 * twilight + 0.10 * dayHaze, 0.0, 1.0);
+    float weatherFogAmount = 1.0;
+    float fogAmount = lerp(clearFogAmount, weatherFogAmount, rain);
+    // More extinction after the clear-radius ramp gives a stronger horizon haze without washing out
+    // blocks around the player. Thunder remains the densest state.
+    float clearSigmaT = 0.00190 + 0.00085 * twilight + 0.00130 * dayHaze;
+    float weatherSigmaT = 0.0060 + 0.0050 * thunder;
+    float sigmaT = lerp(clearSigmaT, weatherSigmaT, rain);
+    if (sigmaT > 1.0e-6) {
+        float distanceToGuide = length(gv_hitCamRel);
+        float maxFogDistance = lerp(360.0, 480.0, rain);
+        float transmittance = exp(-sigmaT
+                * fogWeightedDistance(min(distanceToGuide, maxFogDistance), rain));
+        frameRadiance = frameRadiance * transmittance
+                + integrateVolumetricFog(origin, dir, distanceToGuide, sigmaT, fogAmount,
+                        rain, thunder, twilight);
+    }
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
@@ -1393,7 +1478,8 @@ void main() {
 
     // Guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
     gNormal[pix] = float4(gv_normal, gv_rough);
-    gAlbedo[pix] = float4(gv_albedo, 1.0);
+    // Alpha is unused by DLSS/OIDN (both consume RGB); reserve it for the NRD in-lobe hit distance.
+    gAlbedo[pix] = float4(gv_albedo, nrdHitDistance);
     gDepth[pix] = gv_depth;
     gSpecAlbedo[pix] = float4(gv_specAlb, 1.0); // specular albedo for RR demodulation
 
@@ -1420,24 +1506,25 @@ void main() {
     gSpecMotion[pix] = specMotion;
 
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
-    if (pc.debugView != 0u) {
+    if (debugMode != 0u) {
         float3 dbg;
-        if (pc.debugView == 1u) {
+        if (debugMode == 1u) {
             dbg = gv_normal * 0.5 + 0.5;            // world normal -> [0,1]
-        } else if (pc.debugView == 2u) {
+        } else if (debugMode == 2u) {
             dbg = gv_albedo;                        // diffuse albedo
-        } else if (pc.debugView == 3u) {
+        } else if (debugMode == 3u) {
             dbg = float3(gv_depth, gv_depth, gv_depth); // HW reversed-Z depth (near=white, far/sky=black)
-        } else if (pc.debugView == 4u) {
+        } else if (debugMode == 4u) {
             dbg = float3(gv_rough, gv_rough, gv_rough); // roughness
-        } else if (pc.debugView == 6u) {
+        } else if (debugMode == 6u) {
             dbg = gv_specAlb;                       // specular albedo
-        } else if (pc.debugView == 7u) {
+        } else if (debugMode == 7u) {
             dbg = float3(clamp(0.5 + specMotion * 0.05, 0.0, 1.0), 0.5); // reflection motion
-        } else if (pc.debugView == 8u) {
+        } else if (debugMode == 8u) {
             dbg = float3(gv_emission, gv_emission, gv_emission); // resolved emission mask/strength
-        } else if (pc.debugView == 9u) {
-            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
+        } else if (debugMode == 9u) {
+            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_OVERRIDE ? float3(1.0, 0.2, 1.0)
+                    : gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
                     : gv_emissionSource == EMISSION_SOURCE_HEURISTIC ? float3(1.0, 0.45, 0.05)
                     : gv_emissionSource == EMISSION_SOURCE_UNIFORM ? float3(1.0, 1.0, 1.0)
                     : float3(0.0, 0.0, 0.0);
@@ -1450,6 +1537,49 @@ void main() {
         return;
     }
 
-    // Single noisy estimate; the denoiser (DLSS-RR) handles temporal convergence.
-    outImage[pix] = float4(frameRadiance, 1.0);
+    // Native-only raw accumulation. At reduced ray budgets only the active phase reaches raygen, so
+    // this history is updated only by genuine rays. Checkerboard-reconstructed pixels are kept in a
+    // separate history and can never become Monte Carlo samples for another native pixel.
+    bool accumEnabled = (worldPush.flags & 0x100000u) != 0u;
+    float nativeSampleCount = 0.0;
+    bool acceptedHistory = false;
+    if (accumEnabled && debugMode == 0u && worldPush.frameIndex > 0u) {
+        float4 historySample = rawHistoryColor[pix];
+        float3 prev = historySample.rgb;
+        nativeSampleCount = clamp(historySample.a, 0.0, 1024.0);
+        float3 previousNormal = rawHistoryNormal[pix].xyz;
+        float previousDepth = rawHistoryDepth[pix];
+        float currentNormalLength = length(gv_normal);
+        float previousNormalLength = length(previousNormal);
+        bool currentSky = currentNormalLength < 0.25;
+        bool previousSky = previousNormalLength < 0.25;
+        float normalAgreement = currentSky && previousSky ? 1.0
+                : (!currentSky && !previousSky
+                    ? dot(gv_normal / currentNormalLength, previousNormal / previousNormalLength)
+                    : -1.0);
+        float depthScale = max(max(abs(gv_depth), abs(previousDepth)), 1.0e-4);
+        float depthDifference = abs(gv_depth - previousDepth) / depthScale;
+        bool finiteHistory = nativeSampleCount >= 0.5 && all(isfinite(prev)) && all(prev >= 0.0)
+                && max(prev.x, max(prev.y, prev.z)) < 32768.0;
+        // Animated clouds share the sky guide normal/depth. Averaging them here for 32 frames creates
+        // stationary-camera trails; the active denoiser owns sky temporal reconstruction instead.
+        acceptedHistory = finiteHistory && gv_historyStable && !currentSky
+                && normalAgreement >= 0.82 && depthDifference <= 0.055;
+        if (acceptedHistory) {
+            float boundedCount = min(nativeSampleCount, 1023.0);
+            float currentWeight = 1.0 / (boundedCount + 1.0);
+            frameRadiance = prev * (1.0 - currentWeight) + frameRadiance * currentWeight;
+        }
+    }
+
+    // Do not allow NaN/Inf to enter either output or native history.
+    if (!all(isfinite(frameRadiance)) || any(frameRadiance < 0.0)) frameRadiance = float3(0.0);
+    float3 safeRadiance = min(frameRadiance, float3(32768.0));
+    outImage[pix] = float4(safeRadiance, 1.0);
+    if (accumEnabled) {
+        float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, 1024.0) : 1.0;
+        rawHistoryColor[pix] = float4(safeRadiance, nextCount);
+        rawHistoryNormal[pix] = gNormal[pix];
+        rawHistoryDepth[pix] = gv_depth;
+    }
 }

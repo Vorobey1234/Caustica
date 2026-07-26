@@ -102,6 +102,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private final RtTextVertexConsumer textVertexConsumer = new RtTextVertexConsumer();
     private final TextGlyphVisitor textGlyphVisitor = new TextGlyphVisitor();
     private final RtCustomQuadVertexConsumer customQuadVertexConsumer = new RtCustomQuadVertexConsumer();
+    private final RtCustomTriangleVertexConsumer customTriangleVertexConsumer = new RtCustomTriangleVertexConsumer();
     private final RtLineVertexConsumer lineVertexConsumer = new RtLineVertexConsumer();
     // Staging for Fabric Renderer API mesh quads (addMeshQuad); reused across quads, single-threaded.
     private final float[] meshX = new float[4], meshY = new float[4], meshZ = new float[4];
@@ -188,9 +189,10 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         } finally {
             RtFrameStats.FRAME.endStage("entity.capture.submit.material", materialStart);
         }
-        // Pose the model from its render state (idempotent re-pose; mirrors what the renderer does for
-        // its feature layers), then render the posed parts into the capture. renderToBuffer applies the
-        // PoseStack to every vertex/normal, so the capture receives world-/camera-relative geometry.
+        // Model.setupAnim starts by resetting every ModelPart to its baked pose, then applies this exact
+        // render state. Match Minecraft's deferred model-node renderer for every submission: feature
+        // layers can mutate or reuse the same model between nodes, so caching a previous setup here leaves
+        // animal parts in another layer/entity's pose.
         long setupStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
             model.setupAnim(state);
@@ -777,9 +779,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 .getAtlasOrThrow(quad.atlas().getId()).spriteFinder().find(quad);
         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(quad.atlas().getTextureLocation());
         // Chunk-layer translucency denotes a block-derived dielectric; a blended item render type denotes
-        // ordinary stochastic alpha when the quad did not come from such a layer.
-        boolean transmissive = quad.chunkLayer() == ChunkSectionLayer.TRANSLUCENT;
-        boolean stochasticAlpha = itemMesh && !transmissive && quad.itemRenderType() != null
+        // ordinary stochastic alpha when the quad did not come from such a layer. Gate the thin-dielectric
+        // classification on the block actually being a glass/ice/etc. block so a resource pack mislabeling
+        // cutout foliage or solid stairs as TRANSLUCENT does not turn them into glossy glass.
+        boolean layerTranslucent = quad.chunkLayer() == ChunkSectionLayer.TRANSLUCENT;
+        boolean transmissive = layerTranslucent && (state == null || RtMaterials.isThinDielectric(state));
+        boolean stochasticAlpha = itemMesh && !layerTranslucent && quad.itemRenderType() != null
                 && quad.itemRenderType().hasBlending();
         capture.currentAlphaBucket = alphaBucket(quad.chunkLayer(), stochasticAlpha);
         if (state != null) {
@@ -852,7 +857,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         PrimitiveTopology topology = primitiveTopology(renderType);
         boolean lines = topology == PrimitiveTopology.LINES || topology == PrimitiveTopology.DEBUG_LINES
                 || renderType == RenderTypes.lines() || renderType == RenderTypes.linesTranslucent();
-        if (!lines && topology != PrimitiveTopology.QUADS) {
+        // Triangles are emitted by resource-pack custom models (e.g. sphere replacements for cows/boats).
+        // A dedicated triangle consumer buffers 3 vertices at a time and emits each as a degenerate quad
+        // (one real triangle + one zero-area triangle the ray tracer never hits) so the existing
+        // quad-based upload/BLAS/prim-record pipeline handles them without a separate path.
+        boolean triangles = !lines && topology == PrimitiveTopology.TRIANGLES;
+        if (!lines && topology != PrimitiveTopology.QUADS && !triangles) {
             return;
         }
 
@@ -873,6 +883,10 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             lineVertexConsumer.begin();
             customGeometryRenderer.render(poseStack.last(), lineVertexConsumer);
             lineVertexConsumer.finish();
+        } else if (triangles) {
+            customTriangleVertexConsumer.begin();
+            customGeometryRenderer.render(poseStack.last(), customTriangleVertexConsumer);
+            customTriangleVertexConsumer.finish();
         } else {
             customQuadVertexConsumer.begin();
             customGeometryRenderer.render(poseStack.last(), customQuadVertexConsumer);
@@ -950,6 +964,105 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             this.nx = x;
             this.ny = y;
             this.nz = z;
+            return this;
+        }
+
+        @Override public VertexConsumer setLineWidth(float width) { return this; }
+    }
+
+    /**
+     * Buffers triangle-list vertices from a Fabric Renderer API {@code CustomGeometryRenderer} (e.g.
+     * resource-pack sphere replacements for cows/boats) and emits each complete triangle as a degenerate
+     * quad via {@link RtEntityCapture#addDirectTriangle}. Mirrors {@link RtCustomQuadVertexConsumer}'s
+     * commit-on-next-vertex pattern (vanilla does not expose an explicit endVertex call).
+     */
+    private final class RtCustomTriangleVertexConsumer implements VertexConsumer {
+        private final float[] x = new float[3], y = new float[3], z = new float[3];
+        private final float[] u = new float[3], v = new float[3];
+        private final float[] nx = new float[3], ny = new float[3], nz = new float[3];
+        private final int[] color = new int[3];
+        private int n;
+        private float cx, cy, cz, cu, cv, cnx, cny, cnz;
+        private int ccolor;
+        private boolean pending;
+
+        void begin() {
+            n = 0;
+            pending = false;
+        }
+
+        void finish() {
+            commit();
+            if (n != 0) {
+                int incomplete = n;
+                n = 0;
+                throw new IllegalStateException("custom triangle geometry left an incomplete triangle ("
+                        + incomplete + " vertices)");
+            }
+        }
+
+        private void commit() {
+            if (!pending) {
+                return;
+            }
+            x[n] = cx; y[n] = cy; z[n] = cz;
+            u[n] = cu; v[n] = cv;
+            nx[n] = cnx; ny[n] = cny; nz[n] = cnz;
+            color[n] = ccolor;
+            n++;
+            pending = false;
+            if (n == 3) {
+                // Emit the triangle as a degenerate quad (vertex 3 = vertex 2). The face normal passed
+                // to addDirectTriangle is vertex 0's authored normal; the capture falls back to a
+                // geometric normal from the triangle edges when the authored normal is zero.
+                capture.addDirectTriangle(x, y, z, u, v, nx[0], ny[0], nz[0], color[0]);
+                n = 0;
+            }
+        }
+
+        @Override
+        public VertexConsumer addVertex(float x, float y, float z) {
+            commit();
+            this.cx = x;
+            this.cy = y;
+            this.cz = z;
+            this.cu = 0f;
+            this.cv = 0f;
+            this.cnx = 0f;
+            this.cny = 0f;
+            this.cnz = 0f;
+            this.ccolor = -1;
+            this.pending = true;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int r, int g, int b, int a) {
+            ccolor = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int color) {
+            this.ccolor = color;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setUv(float u, float v) {
+            this.cu = u;
+            this.cv = v;
+            return this;
+        }
+
+        @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { return this; }
+
+        @Override
+        public VertexConsumer setNormal(float x, float y, float z) {
+            this.cnx = x;
+            this.cny = y;
+            this.cnz = z;
             return this;
         }
 

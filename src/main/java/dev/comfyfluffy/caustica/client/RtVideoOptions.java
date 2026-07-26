@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Locale;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
+import net.minecraft.client.gui.components.Button;
 import net.minecraft.network.chat.Component;
 
 /**
@@ -35,11 +36,21 @@ public final class RtVideoOptions {
             exposureMode(),
             manualEv(),
             spp(),
+            rayBudget(),
+            rayBudgetJitter(),
             maxBounces(),
             sunSize(),
             entities(),
             particles(),
             waterWaves(),
+            temporalDenoiser(),
+            spatialDenoiser(),
+            bmfrDenoiser(),
+            nrdDenoiser(),
+            nrdMethod(),
+            oidnRealtimeDenoiser(),
+            realtimeDenoiserResolution(),
+            accumulationMode(),
             dlssQuality(),
             hdrEnabled(),
             hdrPaperWhite(),
@@ -88,15 +99,41 @@ public final class RtVideoOptions {
             setting::set);
     }
 
+    private static final List<Integer> RAY_BUDGETS = List.of(1, 2, 4, 8, 16);
+
+    private static OptionInstance<Integer> rayBudget() {
+        IntSetting setting = CausticaConfig.Rt.Composite.RAY_BUDGET_DIVISOR;
+        int divisor = RAY_BUDGETS.contains(setting.value()) ? setting.value() : 1;
+        return new OptionInstance<>(
+                "caustica.options.rt.rayBudget",
+                OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.rayBudget.tooltip")),
+                (caption, position) -> Options.genericValueLabel(caption,
+                        Component.translatable("caustica.options.rt.rayBudget." + RAY_BUDGETS.get(position))),
+                new OptionInstance.IntRange(0, RAY_BUDGETS.size() - 1),
+                RAY_BUDGETS.indexOf(divisor),
+                position -> setting.set(RAY_BUDGETS.get(position)));
+    }
+
+    private static OptionInstance<Boolean> rayBudgetJitter() {
+        return bool("caustica.options.rt.rayBudgetJitter",
+                CausticaConfig.Rt.Composite.RAY_BUDGET_JITTER);
+    }
+
+    private static final List<Integer> PATH_BOUNCES = List.of(2, 4, 8, 16, 32, 0);
+
     private static OptionInstance<Integer> maxBounces() {
         IntSetting setting = CausticaConfig.Rt.Composite.MAX_BOUNCES;
+        int selected = PATH_BOUNCES.contains(setting.value()) ? setting.value() : 4;
         return new OptionInstance<>(
             "caustica.options.rt.maxBounces",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.maxBounces.tooltip")),
-            (caption, value) -> Options.genericValueLabel(caption, value),
-            new OptionInstance.IntRange(2, 8),
-            Math.clamp(setting.value(), 2, 8),
-            setting::set);
+            (caption, position) -> Options.genericValueLabel(caption,
+                    PATH_BOUNCES.get(position) == 0
+                            ? Component.translatable("caustica.options.rt.maxBounces.infinite")
+                            : Component.literal(Integer.toString(PATH_BOUNCES.get(position)))),
+            new OptionInstance.IntRange(0, PATH_BOUNCES.size() - 1),
+            PATH_BOUNCES.indexOf(selected),
+            position -> setting.set(PATH_BOUNCES.get(position)));
     }
 
     private static OptionInstance<Integer> sunSize() {
@@ -122,6 +159,99 @@ public final class RtVideoOptions {
 
     private static OptionInstance<Boolean> waterWaves() {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+    }
+
+    private static OptionInstance<Boolean> temporalDenoiser() {
+        return bool("caustica.options.rt.temporalDenoiser", CausticaConfig.Rt.Denoiser.TEMPORAL_ENABLED);
+    }
+
+    private static OptionInstance<Boolean> spatialDenoiser() {
+        return bool("caustica.options.rt.spatialDenoiser", CausticaConfig.Rt.Denoiser.SPATIAL_ENABLED);
+    }
+
+    private static OptionInstance<Boolean> oidnRealtimeDenoiser() {
+        return OptionInstance.createBoolean(
+                "caustica.options.rt.oidnRealtimeDenoiser",
+                OptionInstance.cachedConstantTooltip(Component.translatable(
+                        "caustica.options.rt.oidnRealtimeDenoiser.tooltip")),
+                CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value(),
+                enabled -> {
+                    CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(enabled);
+                    if (enabled) {
+                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(false);
+                    }
+                });
+    }
+
+    private static OptionInstance<Boolean> bmfrDenoiser() {
+        return OptionInstance.createBoolean(
+                "caustica.options.rt.bmfrDenoiser",
+                OptionInstance.cachedConstantTooltip(Component.translatable(
+                        "caustica.options.rt.bmfrDenoiser.tooltip")),
+                CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value(),
+                enabled -> {
+                    CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(enabled);
+                    if (enabled) {
+                        CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
+                    }
+                });
+    }
+
+    private static OptionInstance<Boolean> nrdDenoiser() {
+        return OptionInstance.createBoolean(
+                "caustica.options.rt.nrdDenoiser",
+                OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.nrdDenoiser.tooltip")),
+                CausticaConfig.Rt.Denoiser.NRD_ENABLED.value(),
+                enabled -> {
+                    CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(enabled);
+                    if (enabled) {
+                        CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
+                        CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(false);
+                    }
+                });
+    }
+
+    private static OptionInstance<String> nrdMethod() {
+        StringSetting setting = CausticaConfig.Rt.Denoiser.NRD_METHOD;
+        return new OptionInstance<>(
+                "caustica.options.rt.nrdMethod",
+                OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.nrdMethod.tooltip")),
+                (caption, value) -> Component.translatable("caustica.options.rt.nrdMethod." + value),
+                new OptionInstance.Enum<>(List.of("relax", "reblur", "reference"), Codec.STRING),
+                setting.get(),
+                setting::set);
+    }
+
+    private static OptionInstance<Integer> realtimeDenoiserResolution() {
+        IntSetting setting = CausticaConfig.Rt.Denoiser.REALTIME_RESOLUTION_PERCENT;
+        return new OptionInstance<>(
+                "caustica.options.rt.realtimeDenoiserResolution",
+                OptionInstance.cachedConstantTooltip(Component.translatable(
+                        "caustica.options.rt.realtimeDenoiserResolution.tooltip")),
+                (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+                new OptionInstance.IntRange(25, 100),
+                setting.value(),
+                setting::set);
+    }
+
+    /** One-shot reference capture; unlike an option toggle this cannot accidentally run every frame. */
+    public static Button oidnReferenceButton() {
+        return Button.builder(Component.translatable("caustica.options.rt.oidnReferenceRun"), button -> {
+            CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(false);
+            CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(false);
+            CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
+            CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(true);
+        }).width(310).build();
+    }
+
+
+    private static OptionInstance<Boolean> accumulationMode() {
+        return bool("caustica.options.rt.accumulation", CausticaConfig.Rt.Composite.ACCUMULATION_ENABLED);
     }
 
     // NVSDK_NGX_PerfQuality_Value, ordered performance -> quality for the slider. Per NVIDIA's DLSS-RR
@@ -190,4 +320,5 @@ public final class RtVideoOptions {
             setting.value(),
             setting::set);
     }
+
 }

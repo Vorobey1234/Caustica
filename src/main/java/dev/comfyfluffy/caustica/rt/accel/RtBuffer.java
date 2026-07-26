@@ -60,4 +60,16 @@ public final class RtBuffer {
         }
         Vma.vmaFlushAllocation(vma, allocation, offset, length);
     }
+
+    /** Invalidate a GPU-written host-visible range before reading it on the CPU. */
+    public void invalidate(long offset, long length) {
+        if (!hostVisible) {
+            throw new IllegalStateException("Cannot invalidate a non-host-visible buffer");
+        }
+        if (offset < 0L || length < 0L || offset > size || length > size - offset) {
+            throw new IndexOutOfBoundsException("Invalidate range " + offset + ".." + (offset + length)
+                    + " exceeds buffer size " + size);
+        }
+        Vma.vmaInvalidateAllocation(vma, allocation, offset, length);
+    }
 }

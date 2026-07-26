@@ -2,8 +2,10 @@ package dev.comfyfluffy.caustica.client;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.compat.DistantHorizonsCompat;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
+import dev.comfyfluffy.caustica.rt.terrain.RtDistantHorizonsTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 public final class VanillaRenderController {
@@ -17,6 +19,8 @@ public final class VanillaRenderController {
 	private boolean loggedActive;
 	private boolean loggedWaitingForRtPlayerSection;
 	private boolean loggedRtPlayerSectionReady;
+	private boolean loggedDistantHorizonsHybrid;
+	private boolean loggedDistantHorizonsRtOnly;
 	private boolean rtActive = true;
 	private Boolean lastLoggedRtActive;
 	private String inactiveReason;
@@ -76,6 +80,21 @@ public final class VanillaRenderController {
 		if (!this.projectionCaptured) {
 			logInactive("level projection was not captured");
 			return false;
+		}
+		// Keep DH raster only while the first RT proxy streams progressively. It fills sections that have
+		// not reached RT yet; after the initial plan completes, later refreshes stay fully RT and never
+		// re-enable the mismatched raster fallback that caused disappearing shadows.
+		if (DistantHorizonsCompat.enabled()
+				&& !RtDistantHorizonsTerrain.INSTANCE.bootstrapComplete()) {
+			if (!this.loggedDistantHorizonsHybrid) {
+				this.loggedDistantHorizonsHybrid = true;
+				CausticaMod.LOGGER.info("Distant Horizons bootstrap raster active while the first RT proxy streams progressively");
+			}
+			return false;
+		}
+		if (DistantHorizonsCompat.enabled() && !this.loggedDistantHorizonsRtOnly) {
+			this.loggedDistantHorizonsRtOnly = true;
+			CausticaMod.LOGGER.info("Distant Horizons RT proxy active; raster fallback disabled");
 		}
 		if (waitingForRtPlayerSection && !this.loggedWaitingForRtPlayerSection) {
 			this.loggedWaitingForRtPlayerSection = true;
