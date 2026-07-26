@@ -230,6 +230,22 @@ public final class DistantHorizonsCompat {
         return LOADED;
     }
 
+    /**
+     * Ask DH to discard only its in-memory render/quadtree data. Keep Caustica's last captured CPU meshes
+     * as an atomic fallback while DH repopulates its quadtree: clearing both caches at once would allow the
+     * first partial upload batch to replace the complete RT proxy and briefly leave large holes. Fresh DH
+     * uploads replace these retained entries by key/version and trigger the normal revision rebuild. No
+     * saved LOD database or world data is deleted.
+     */
+    public static boolean reloadRenderDataCache() {
+        if (!enabled()) return false;
+        try {
+            return ReloadApi.INSTANCE.clearRenderDataCache();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
 
     /** Current DH horizontal quality. Changes are polled by the RT proxy to trigger immediate refinement. */
     public static LodQuality lodQuality() {
@@ -395,6 +411,35 @@ public final class DistantHorizonsCompat {
                 if (section != null) result.add(lodRenderSectionPos.getLong(section));
             }
             return result;
+        }
+    }
+
+    /** Public DH render-cache reload API, isolated so optional-version drift cannot disable capture. */
+    private static final class ReloadApi {
+        static final ReloadApi INSTANCE = new ReloadApi();
+        private final Field renderProxyField;
+        private final Method clearRenderDataCache;
+        private final Field resultSuccess;
+
+        private ReloadApi() {
+            try {
+                Class<?> delayed = Class.forName("com.seibel.distanthorizons.api.DhApi$Delayed");
+                Class<?> renderProxy = Class.forName(
+                        "com.seibel.distanthorizons.api.interfaces.render.IDhApiRenderProxy");
+                Class<?> result = Class.forName("com.seibel.distanthorizons.api.objects.DhApiResult");
+                renderProxyField = delayed.getField("renderProxy");
+                clearRenderDataCache = renderProxy.getMethod("clearRenderDataCache");
+                resultSuccess = result.getField("success");
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Unsupported Distant Horizons render reload API", e);
+            }
+        }
+
+        boolean clearRenderDataCache() throws ReflectiveOperationException {
+            Object proxy = renderProxyField.get(null);
+            if (proxy == null) return false;
+            Object result = clearRenderDataCache.invoke(proxy);
+            return result != null && resultSuccess.getBoolean(result);
         }
     }
 

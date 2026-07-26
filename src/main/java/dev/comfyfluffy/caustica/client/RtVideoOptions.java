@@ -6,8 +6,11 @@ import dev.comfyfluffy.caustica.CausticaConfig.BooleanSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.FloatSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.IntSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.StringSetting;
+import dev.comfyfluffy.caustica.compat.DistantHorizonsCompat;
+import dev.comfyfluffy.caustica.rt.terrain.RtDistantHorizonsTerrain;
 import java.util.List;
 import java.util.Locale;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
 import net.minecraft.client.gui.components.Button;
@@ -247,6 +250,19 @@ public final class RtVideoOptions {
             CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
             CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(true);
         }).width(310).build();
+    }
+
+    /** Force DH and Caustica's RT proxy to rebuild after changing Distant Horizons quality settings. */
+    public static Button distantHorizonsRefreshButton() {
+        Button button = Button.builder(Component.translatable("caustica.options.rt.dhRefresh"), clicked -> {
+            boolean dhReloaded = DistantHorizonsCompat.reloadRenderDataCache();
+            RtDistantHorizonsTerrain.INSTANCE.requestFullRefresh();
+            clicked.setMessage(Component.translatable(dhReloaded
+                    ? "caustica.options.rt.dhRefresh.queued"
+                    : "caustica.options.rt.dhRefresh.rtOnly"));
+        }).width(310).build();
+        button.active = DistantHorizonsCompat.enabled() && Minecraft.getInstance().level != null;
+        return button;
     }
 
 

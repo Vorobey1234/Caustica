@@ -70,6 +70,7 @@ public abstract class VideoSettingsScreenMixin {
         list.addHeader(CAUSTICA$RT_HEADER);
         list.addSmall(RtVideoOptions.runtimeOptions());
         list.addBig(RtVideoOptions.oidnReferenceButton());
+        list.addBig(RtVideoOptions.distantHorizonsRefreshButton());
     }
 
     @Inject(method = "removed", at = @At("TAIL"))

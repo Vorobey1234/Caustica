@@ -77,4 +77,7 @@
   "caustica.options.rt.accumulation.tooltip": "When enabled, frames are accumulated over time for a cleaner image (resets on camera movement). Disable for instant response.",
   "caustica.options.rt.rayBudgetJitter": "Ray Budget Jitter",
   "caustica.options.rt.rayBudgetJitter.tooltip": "Covers every native pixel over 2–16 dephased frames and jitters samples inside each pixel. Unsafe raw accumulation is bypassed to prevent stationary-camera history stretching."
+  ,"caustica.options.rt.dhRefresh": "Reload Distant Horizons Chunks"
+  ,"caustica.options.rt.dhRefresh.queued": "Distant Horizons Reload Queued"
+  ,"caustica.options.rt.dhRefresh.rtOnly": "Caustica RT Proxy Reload Queued"
 }

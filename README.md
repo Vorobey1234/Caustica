@@ -79,6 +79,9 @@ For the best quality/performance balance, use:
 - Use Java args to improve performance. Minecraft Launcher default:
   `-XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC`
 - Frame Generation is experimental and needs to be enabled by modifying the configuration file.
+- After changing Distant Horizons quality or distance settings, use **Reload Distant Horizons Chunks**
+  in Video Settings. It refreshes DH's in-memory render cache and atomically rebuilds Caustica's RT
+  proxy without deleting saved LOD or world data.
 - HDR output requires an HDR swapchain and a correctly configured HDR display.
 - When HDR is enabled on Linux, Caustica selects GLFW's native Wayland backend automatically. X11/XWayland surfaces generally do not expose the required HDR10/PQ format.
 - If Minecraft falls back to OpenGL after a crash, re-enable the Vulkan backend

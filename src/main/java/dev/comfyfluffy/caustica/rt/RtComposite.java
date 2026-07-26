@@ -2230,11 +2230,11 @@ public final class RtComposite {
         if (atlasSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                        // Preserve Minecraft's pixel-art texels at every stage. Point filtering is used
-                        // both inside a mip and between mip levels, so block/entity albedo, material masks,
-                        // and authored pixel textures never receive implicit bilinear or trilinear blur.
+                        // Preserve Minecraft's pixel-art texels inside each mip, but blend adjacent mip
+                        // levels continuously. Nearest spatial filtering keeps texels crisp while linear
+                        // mip interpolation removes camera-centred rings at footprint boundaries.
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
-                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
@@ -2254,11 +2254,10 @@ public final class RtComposite {
         if (materialNormalSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                        // Keep authored normal/AO texels point sampled too. Camera-centred normal rings are
-                        // handled in the hit shader by a continuous footprint-based strength fade, not by
-                        // bilinear/trilinear filtering that softens every normal-map and data-map texel.
+                        // Normal/data texels remain point sampled spatially. Adjacent semantic mips blend
+                        // continuously so their physical detail reduction cannot form distance rings.
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
-                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                         .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)

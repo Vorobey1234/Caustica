@@ -66,8 +66,8 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 static float3 gv_motionObjDisp;
-// Raw-history class: 0 unstable, 1 static/clear sky, 2 entity, 3 water.
-static uint gv_historyClass;
+// Primary surfaces eligible for depth/normal-validated native raw accumulation.
+static bool gv_historyStable;
 // Dynamic primary pixels must not retain an old native checkerboard phase.
 static bool gv_dynamicSurface;
 
@@ -128,6 +128,26 @@ float cloudShadowTransmittance(float3 surfacePos, float3 lightDir) {
         opticalDepth += cloudDensity(samplePos, params) * stepLength * CLOUD_SIGMA_T;
     }
     return lerp(1.0, exp(-opticalDepth * 1.35), daylight * grazing);
+}
+
+// Three-point Gauss-Legendre optical-depth estimate used only by the atmospheric view integral. It
+// samples the same world-anchored cloud field as surface shadows, but avoids the six-step surface query
+// at every view segment: four view segments × three samples retains the old total density cost (12).
+float cloudFogTransmittance(float3 samplePos, float3 lightDir, CloudParams params) {
+    float daylight = smoothstep(0.01, 0.12, worldPush.sunDir.y);
+    float grazing = smoothstep(0.015, 0.08, lightDir.y);
+    if (daylight <= 0.0 || grazing <= 0.0) return 1.0;
+    float t0, t1;
+    if (!cloudInterval(samplePos, lightDir, t0, t1)) return 1.0;
+    float center = 0.5 * (t0 + t1);
+    float halfSpan = 0.5 * (t1 - t0);
+    float offset = 0.7745966692 * halfSpan;
+    float densityIntegral = halfSpan * (
+            (5.0 / 9.0) * cloudDensity(samplePos + lightDir * (center - offset), params)
+            + (8.0 / 9.0) * cloudDensity(samplePos + lightDir * center, params)
+            + (5.0 / 9.0) * cloudDensity(samplePos + lightDir * (center + offset), params));
+    float transmittance = exp(-CLOUD_SIGMA_T * 1.20 * densityIntegral);
+    return lerp(1.0, transmittance, daylight * grazing);
 }
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass).
@@ -675,7 +695,7 @@ float fogWeightedDistance(float distanceToSurface, float rain) {
 
 float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToSurface,
                               float sigmaT, float fogAmount, float rain, float thunder,
-                              float twilight) {
+                              float twilight, bool primarySky) {
     float maxDistance = lerp(360.0, 480.0, rain);
     float surfaceDistance = min(max(distanceToSurface, 0.0), maxDistance);
     float fogStart = fogStartDistance(rain);
@@ -696,32 +716,46 @@ float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToS
             ? rawLight / rawLightLum : float3(1.0, 1.0, 1.0);
     float lightStrength = min(rawLightLum, 4.0);
 
-    // The old ray march evaluated a binary shadow at many discrete distances. Each distance projected a
-    // slightly different copy of the occluder into the fog, which appeared as the repeated skyscraper
-    // silhouettes in motion. Two soft, deterministic control points give one coherent shaft field and
-    // integrate the rest analytically, removing both depth bands and frame-to-frame blue-noise crawl.
+    // Geometry gets only two soft control points; cloud shafts below are integrated independently in
+    // four world-space view segments. Sky rays skip geometry queries entirely so distant buildings can
+    // never be stretched into radial silhouettes across the sky.
     float nearT = fogStart + marchDistance * 0.30;
     float farT = fogStart + marchDistance * 0.72;
     float3 nearPos = rayOrigin + rayDir * nearT;
     float3 farPos = rayOrigin + rayDir * farT;
-    float nearVisibility = softFogVisibility(nearPos, lightDir, false);
-    float farVisibility = softFogVisibility(farPos, lightDir, true);
-    float distanceBlend = smoothstep(24.0, 150.0, marchDistance);
-    float rawVisibility = lerp(nearVisibility, nearVisibility * 0.42 + farVisibility * 0.58, distanceBlend);
-    // Atmospheric shafts should modulate the haze, not stamp binary building cut-outs into it.
-    // Keep shaft contrast broad and low-frequency. This prevents a single facade from becoming a
-    // dark cut-out while retaining local rays from full-resolution terrain.
-    float meanVisibility = lerp(1.0, smoothstep(0.06, 0.94, rawVisibility), 0.32);
-    // The same cloud volume that is visible in the miss shader also gates the light injected into fog.
-    float cloudVisibility = 0.5 * (cloudShadowTransmittance(nearPos, lightDir)
-            + cloudShadowTransmittance(farPos, lightDir));
-    meanVisibility *= cloudVisibility;
-    float meanDensity = lerp(smoothFogDensity(nearPos), smoothFogDensity(farPos), 0.58);
+    float nearVisibility = primarySky ? 1.0 : softFogVisibility(nearPos, lightDir, false);
+    float farVisibility = primarySky ? 1.0 : softFogVisibility(farPos, lightDir, true);
+    CloudParams cloudParams = sceneCloudParams();
+    float shaftIntegral = 0.0;
+    for (int segment = 0; segment < 4; ++segment) {
+        float ua = float(segment) * 0.25;
+        float ub = float(segment + 1) * 0.25;
+        float ta = fogStart + marchDistance * ua;
+        float tb = fogStart + marchDistance * ub;
+        float3 entryPos = rayOrigin + rayDir * ta;
+        float stableJitter = (cloudNoise2(cloudAbsoluteXZ(entryPos, cloudParams) * 0.0061
+                + float2(17.3, -9.1)) - 0.5) * 0.1125;
+        float u = clamp(0.5 * (ua + ub) + stableJitter, ua + 0.025, ub - 0.025);
+        float3 samplePos = rayOrigin + rayDir * (fogStart + u * marchDistance);
+        float cloudVisibility = lerp(0.06, 1.0,
+                smoothstep(0.06, 0.94, cloudFogTransmittance(samplePos, lightDir, cloudParams)));
+        float geometryVisibility = lerp(nearVisibility, farVisibility, smoothstep(0.18, 0.82, u));
+        geometryVisibility = lerp(1.0, smoothstep(0.06, 0.94, geometryVisibility), 0.25);
+        float segmentWeight = max(
+                exp(-sigmaT * fogWeightedDistance(ta, rain))
+                - exp(-sigmaT * fogWeightedDistance(tb, rain)), 0.0);
+        shaftIntegral += segmentWeight * smoothFogDensity(samplePos)
+                * cloudVisibility * geometryVisibility;
+    }
 
-    float totalExtinction = 1.0 - exp(-sigmaT * opticalDistance * meanDensity);
-    float directScale = lightStrength * 0.038 * phaseRelative * meanVisibility
-            * lerp(0.55, 1.0, fogAmount);
-    float3 direct = lightColor * directScale * totalExtinction;
+    float totalExtinction = 1.0 - exp(-sigmaT * opticalDistance);
+    float daylight = smoothstep(-0.035, 0.10, worldPush.sunDir.y);
+    float atmosphericLight = max(daylight, twilight * 0.45);
+    float directScale = lightStrength * 0.045 * phaseRelative * shaftIntegral
+            * lerp(0.55, 1.0, fogAmount) * (primarySky ? 0.58 : 1.0)
+            * lerp(0.06, 1.0, atmosphericLight);
+    // shaftIntegral already contains the view-segment extinction weights.
+    float3 direct = lightColor * directScale;
     // Keep the low-frequency shaft contribution below the energy removed from the view ray, especially
     // around a low sun where the path-tracer light value is intentionally very bright.
     float3 directLimit = lightColor * (0.075 + 0.11 * rain) * totalExtinction;
@@ -737,6 +771,9 @@ float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToS
     ambientColor = lerp(ambientColor, float3(0.38, 0.47, 0.60), 0.65 * clearDayWeight);
     float ambientStrength = 0.13 + 0.11 * fogAmount + 0.05 * twilightWeight
             + 0.07 * clearDayWeight;
+    // Keep clear nights genuinely black and storm nights dark instead of filling the sky with a flat
+    // grey ambient term. Dawn/dusk ramps this energy back in smoothly.
+    ambientStrength *= lerp(0.015, 1.0, atmosphericLight);
     return direct + ambientColor * totalExtinction * ambientStrength;
 }
 
@@ -860,7 +897,7 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
 float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                  out float firstIndirectHitDistance) {
     firstIndirectHitDistance = 0.0;
-    gv_historyClass = 0u;
+    gv_historyStable = false;
     gv_dynamicSurface = false;
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
@@ -911,7 +948,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 // Clear atmosphere is stable; moving volumetric clouds are not. Clouds deliberately do
                 // not use the sparse-resolve dynamic tag: spatially expanding one cloud ray across an
                 // already valid checkerboard tile creates the long radial streaks seen with ReBLUR.
-                gv_historyClass = cloudGuideDistance <= 0.0 ? 1u : 0u;
+                gv_historyStable = cloudGuideDistance <= 0.0;
                 // Opaque cloud pixels reproject at their optical centroid, so camera translation gives
                 // them finite parallax instead of treating the moving world-anchored volume as a star.
                 gv_motionHitCamRel = cloudGuideDistance > 0.0
@@ -946,14 +983,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         if (bounce == 0) {
             gv_emission = payloadEmission();
             gv_emissionSource = payloadEmissionSource();
-            bool entitySurface = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) != 0u;
-            // Keep independent histories for static surfaces, entities and water. Particles remain
-            // unstable; their short-lived billboards do not have a reliable per-pixel surface identity.
-            gv_historyClass = material == MATERIAL_PARTICLE ? 0u
-                    : material == MATERIAL_WATER ? 3u
-                    : entitySurface ? 2u : 1u;
-            gv_dynamicSurface = entitySurface
-                    || material == MATERIAL_WATER || material == MATERIAL_PARTICLE;
+            // Only immutable primary surfaces may enter raw accumulation. Dynamic entity poses, water
+            // waves and particles are refreshed from the current frame instead of retaining stale shapes.
+            gv_historyStable = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) == 0u
+                    && material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
+            gv_dynamicSurface = !gv_historyStable;
         }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
@@ -1428,13 +1462,17 @@ void main() {
     float weatherSigmaT = 0.0060 + 0.0050 * thunder;
     float sigmaT = lerp(clearSigmaT, weatherSigmaT, rain);
     if (sigmaT > 1.0e-6) {
+        bool primarySky = length(gv_normal) < 0.25;
         float distanceToGuide = length(gv_hitCamRel);
         float maxFogDistance = lerp(360.0, 480.0, rain);
         float transmittance = exp(-sigmaT
                 * fogWeightedDistance(min(distanceToGuide, maxFogDistance), rain));
+        // Use one atmosphere for geometry, clouds and clear sky. A shared extinction/scattering path
+        // makes distant buildings converge toward the same horizon colour instead of forming three
+        // disconnected colour layers.
         frameRadiance = frameRadiance * transmittance
                 + integrateVolumetricFog(origin, dir, distanceToGuide, sigmaT, fogAmount,
-                        rain, thunder, twilight);
+                        rain, thunder, twilight, primarySky);
     }
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
@@ -1518,7 +1556,7 @@ void main() {
         nativeSampleCount = clamp(historySample.a, 0.0, 1024.0);
         float4 previousNormalAndState = rawHistoryNormal[pix];
         float3 previousNormal = previousNormalAndState.xyz;
-        uint previousHistoryClass = uint(clamp(round(previousNormalAndState.w), 0.0, 3.0));
+        bool previousHistoryStable = previousNormalAndState.w >= 0.0;
         float previousDepth = rawHistoryDepth[pix];
         float currentNormalLength = length(gv_normal);
         float previousNormalLength = length(previousNormal);
@@ -1532,17 +1570,12 @@ void main() {
         float depthDifference = abs(gv_depth - previousDepth) / depthScale;
         bool finiteHistory = nativeSampleCount >= 0.5 && all(isfinite(prev)) && all(prev >= 0.0)
                 && max(prev.x, max(prev.y, prev.z)) < 32768.0;
-        bool dynamicHistory = gv_historyClass >= 2u;
-        float normalThreshold = dynamicHistory ? 0.62 : 0.82;
-        float depthThreshold = dynamicHistory ? 0.12 : 0.055;
-        // A class match prevents an entity/water pixel from inheriting terrain or clear-sky radiance.
-        // Dynamic histories use a finite window below, retaining convergence without freezing animation.
-        acceptedHistory = finiteHistory && gv_historyClass != 0u
-                && previousHistoryClass == gv_historyClass
-                && normalAgreement >= normalThreshold && depthDifference <= depthThreshold;
+        // The history alpha distinguishes stable terrain/clear sky from clouds and dynamic geometry.
+        // Animated entities, water and particles never average old poses or animated surface states.
+        acceptedHistory = finiteHistory && gv_historyStable && previousHistoryStable
+                && normalAgreement >= 0.82 && depthDifference <= 0.055;
         if (acceptedHistory) {
-            float historyLimit = dynamicHistory ? 32.0 : 1024.0;
-            float boundedCount = min(nativeSampleCount, historyLimit - 1.0);
+            float boundedCount = min(nativeSampleCount, 1023.0);
             float currentWeight = 1.0 / (boundedCount + 1.0);
             frameRadiance = prev * (1.0 - currentWeight) + frameRadiance * currentWeight;
         }
@@ -1553,10 +1586,9 @@ void main() {
     float3 safeRadiance = min(frameRadiance, float3(32768.0));
     outImage[pix] = float4(safeRadiance, 1.0);
     if (accumEnabled) {
-        float historyLimit = gv_historyClass >= 2u ? 32.0 : 1024.0;
-        float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, historyLimit) : 1.0;
+        float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, 1024.0) : 1.0;
         rawHistoryColor[pix] = float4(safeRadiance, nextCount);
-        rawHistoryNormal[pix] = float4(gv_normal, float(gv_historyClass));
+        rawHistoryNormal[pix] = float4(gv_normal, gv_historyStable ? gv_rough : -1.0);
         rawHistoryDepth[pix] = gv_depth;
     }
 }

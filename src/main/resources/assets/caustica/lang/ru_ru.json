@@ -52,4 +52,7 @@
   "caustica.options.rt.rayBudget.16": "Шахматный (1/16)",
   "caustica.options.rt.rayBudgetJitter": "Jitter для Ray Budget",
   "caustica.options.rt.rayBudgetJitter.tooltip": "За 2–16 разнесённых фаз покрывает каждый native-пиксель и смещает выборку внутри него. Небезопасное raw accumulation отключается, чтобы история не растягивалась при неподвижной камере."
+  ,"caustica.options.rt.dhRefresh": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0447\u0430\u043d\u043a\u0438 Distant Horizons"
+  ,"caustica.options.rt.dhRefresh.queued": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 Distant Horizons \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u0430"
+  ,"caustica.options.rt.dhRefresh.rtOnly": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 RT-\u043f\u0440\u043e\u043a\u0441\u0438 Caustica \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u0430"
 }

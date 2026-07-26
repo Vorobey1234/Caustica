@@ -23,6 +23,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -137,8 +138,9 @@ public final class RtEntities {
         return CausticaConfig.Rt.Entities.BE_BUILDS_PER_FRAME.value();
     }
 
-    // EntityGeom: four addresses + rigid displacement + three geometry triangle bases + padding = 64 B.
+    // EntityGeom: four addresses + rigid displacement + two geometry bases + history flags/padding = 64 B.
     private static final int TABLE_ENTRY_BYTES = 64;
+    private static final int ENTITY_HISTORY_DYNAMIC = 1;
     // Ring of fixed-size geometry tables. Each slot carries its exact graphics timeline last-use value;
     // reuse waits for completion, so rebase or an unusually deep GPU queue cannot race a host rewrite.
     private static final int TABLE_RING = 6;
@@ -749,22 +751,25 @@ public final class RtEntities {
                 RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
             }
             curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
-            // Living models deform every frame. Give each captured pose its own transient BLAS so the
-            // RT queue can never observe a half-refitted body paired with a newer head pose.
-            boolean living = entity instanceof LivingEntity;
+            // Mob/animal models deform every frame. Give each captured pose its own transient BLAS so the
+            // RT queue cannot pair a newer limb/head pose with an older body. Players deliberately retain
+            // the original persistent/refit path: it was already correct and preserves player-skin meshes.
+            boolean playerEntity = entity instanceof Player;
+            boolean animatedCreature = entity instanceof LivingEntity && !playerEntity;
+            boolean dynamicHistory = !playerEntity;
             // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
             // re-references that AS through the instance transform — no upload, no refit.
             boolean reused;
             long reuseStart = RtFrameStats.FRAME.startStage();
             try {
-                reused = !living
-                        && appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+                reused = !animatedCreature && appendRigidReuse(ctx, build, motion, id, mask,
+                        ix - rbx, iy - rby, iz - rbz, dynamicHistory);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
             }
             if (!reused) {
-                appendCapture(ctx, build, motion, living ? -1 : id, ENTITY_BIT, mask,
-                        translationTransform(ix - rbx, iy - rby, iz - rbz));
+                appendCapture(ctx, build, motion, animatedCreature ? -1 : id, ENTITY_BIT, mask,
+                        translationTransform(ix - rbx, iy - rby, iz - rbz), dynamicHistory);
             }
             build.logicalCount++;
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
@@ -1009,7 +1014,7 @@ public final class RtEntities {
         }
         long dispAddr = uploadDisp(ctx, build, particleDisp);
         appendCapture(ctx, build, new Motion(dispAddr, 0f, 0f, 0f),
-                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY); // one combined mesh, per-particle MV
+                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY, true); // one combined mesh, per-particle MV
     }
 
     /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
@@ -1249,7 +1254,8 @@ public final class RtEntities {
         // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
         // animating reverts to MV 0 next frame.
         long dispAddr = uploadDisp(ctx, build, disp);
-        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris);
+        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr,
+                0f, 0f, 0f, e.bucketTris, false);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
@@ -1349,7 +1355,7 @@ public final class RtEntities {
      * pose is non-rigid (animation), or the shading data changed under identical topology.
      */
     private boolean appendRigidReuse(RtContext ctx, FrameBuild build, Motion motion, int entityId, int mask,
-                                     float placeX, float placeY, float placeZ) {
+                                     float placeX, float placeY, float placeZ, boolean dynamicHistory) {
         EntityAccel ea = entityAccels.get(entityId);
         if (ea == null || ea.refAccel == null
                 || ea.refVertCount != capture.verts.size() / 3 || ea.refIdxCount != capture.idx.size()) {
@@ -1399,7 +1405,8 @@ public final class RtEntities {
         }
         build.lists.usedEntitySlots.add(ea.refSlot);
         writeTableEntry(build, ea.refPrimAddr, ea.refIndexAddr, ea.refUvAddr,
-                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris);
+                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ,
+                ea.refBucketTris, dynamicHistory);
         build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
                 ea.refAccel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
@@ -1509,17 +1516,19 @@ public final class RtEntities {
      * {@code entityId} ≥ 0 → refit path (persistent updatable AS keyed by id); {@code < 0} (refit disabled)
      * → transient one-shot full BUILD. Used by the animated-entity pass; block entities use {@link #buildBe}.
      */
-    private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId, int instanceBit, int mask) {
+    private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId,
+                               int instanceBit, int mask, boolean dynamicHistory) {
         beginBuildIfNeeded(ctx, build);
         appendCapture(ctx, build, new Motion(uploadDisp(ctx, build, disp), 0f, 0f, 0f),
-                entityId, instanceBit, mask, IDENTITY);
+                entityId, instanceBit, mask, IDENTITY, dynamicHistory);
     }
 
     private void appendCapture(RtContext ctx, FrameBuild build, Motion motion, int entityId, int instanceBit, int mask,
-                               float[] instanceTransform) {
+                               float[] instanceTransform, boolean dynamicHistory) {
         beginBuildIfNeeded(ctx, build);
         if (entityId >= 0) {
-            appendPackedEntity(ctx, build, motion, entityId, instanceBit, mask, instanceTransform);
+            appendPackedEntity(ctx, build, motion, entityId, instanceBit, mask,
+                    instanceTransform, dynamicHistory);
             return;
         }
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
@@ -1553,7 +1562,7 @@ public final class RtEntities {
         build.pooledBlas.add(blas);
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), dynamicHistory);
 
         build.instances.add(new RtAccel.Instance(instanceTransform, blas.accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
@@ -1563,7 +1572,8 @@ public final class RtEntities {
 
     /** Pack one changed entity's four logical geometry regions into its retired ring slot's backing. */
     private void appendPackedEntity(RtContext ctx, FrameBuild build, Motion motion, int entityId,
-                                    int instanceBit, int mask, float[] instanceTransform) {
+                                    int instanceBit, int mask, float[] instanceTransform,
+                                    boolean dynamicHistory) {
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
@@ -1633,7 +1643,7 @@ public final class RtEntities {
         }
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), dynamicHistory);
         build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
 
@@ -1698,7 +1708,8 @@ public final class RtEntities {
 
     /** Write one std430 EntityGeom entry, including bases for the two packed BLAS geometries. */
     private void writeTableEntry(FrameBuild build, long primAddr, long idxAddr, long uvAddr, long dispAddr,
-                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris) {
+                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris,
+                                 boolean dynamicHistory) {
         if (bucketTris == null || bucketTris.length != RtAccel.ENTITY_BUCKETS) {
             throw new IllegalArgumentException("Missing entity BLAS bucket counts");
         }
@@ -1713,7 +1724,7 @@ public final class RtEntities {
         MemoryUtil.memPutFloat(entry + 44, 0f);
         MemoryUtil.memPutInt(entry + 48, 0);
         MemoryUtil.memPutInt(entry + 52, bucketTris[RtAccel.ENTITY_BUCKET_OPAQUE]);
-        MemoryUtil.memPutInt(entry + 56, 0);
+        MemoryUtil.memPutInt(entry + 56, dynamicHistory ? ENTITY_HISTORY_DYNAMIC : 0);
         MemoryUtil.memPutInt(entry + 60, 0);
     }
 

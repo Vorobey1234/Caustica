@@ -96,7 +96,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
             // clear panes visible in reflections without turning them into black shadow blockers.
             float opticalAlpha = clamp(asfloat(dhSurface == DH_SURFACE_EMISSIVE_GLASS
                     ? pr.aux1 : pr.aux0), 0.04, 0.80);
-            float3 paneTint = lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, opticalAlpha);
+            float3 paneTint = glassTransmissionFilter(pr.tint.rgb, opticalAlpha);
             shadowVis.rgb *= paneTint * 0.94;
             IgnoreHit();
             return;
@@ -136,7 +136,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         // model here so entity dielectrics transmit instead of becoming opaque shadow blockers.
         bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
-            float3 tint = lerp(float3(1.0, 1.0, 1.0),
+            float3 tint = glassTransmissionFilter(
                     srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
             shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
             IgnoreHit();
@@ -179,13 +179,13 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     if (bucket == BUCKET_TRANSLUCENT) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
-        float3 avgColor = max(materialHeader.average.rgb * pr.tint.rgb,
+        float3 avgColor = max(srgbToLinear(materialHeader.average.rgb) * pr.tint.rgb,
                 float3(1.0e-3, 1.0e-3, 1.0e-3));
-        float3 colorExtinction = max(-log(avgColor), float3(0.0, 0.0, 0.0));
         // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
         // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
         // white/clear-glass case it's meant to cover.
-        shadowVis.rgb *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
+        shadowVis.rgb *= glassTransmissionFilter(avgColor, materialHeader.average.a)
+                * exp(-TRANSLUCENT_NEUTRAL_EXTINCTION);
         IgnoreHit();
     }
 

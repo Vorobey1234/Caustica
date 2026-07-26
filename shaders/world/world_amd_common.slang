@@ -91,7 +91,7 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
-// Marks animated primary geometry for checkerboard and raw-history classification.
+// Animated primary geometry must never be treated as a stationary raw-accumulation surface.
 public static const uint PAYLOAD_DYNAMIC_SURFACE = 1u << 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;
 public static const uint EMISSION_SOURCE_UNIFORM = 1u;
@@ -104,6 +104,20 @@ public static const uint MATERIAL_OPAQUE = 0u;
 public static const uint MATERIAL_WATER = 1u;
 public static const uint MATERIAL_PARTICLE = 2u;
 public static const uint MATERIAL_GLASS = 3u;
+
+// Convert a transparent texel/average into an optical colour filter. Minecraft stained-glass textures
+// use low alpha for visibility, but that alpha is not the amount of dye: using it directly washed every
+// transmitted shadow back toward white. Saturation identifies coloured glass while clear/white glass
+// remains neutral. The small floor prevents a saturated channel from becoming a numerical black hole.
+public float3 glassTransmissionFilter(float3 linearColor, float alpha) {
+    float3 color = max(linearColor, float3(0.0, 0.0, 0.0));
+    float hi = max(color.r, max(color.g, color.b));
+    float lo = min(color.r, min(color.g, color.b));
+    float saturation = hi > 1.0e-4 ? (hi - lo) / hi : 0.0;
+    float dyeStrength = clamp(max(alpha, saturation * 0.92), 0.0, 0.96);
+    return max(lerp(float3(1.0, 1.0, 1.0), color, dyeStrength),
+            float3(0.012, 0.012, 0.012));
+}
 
 // Coarse Distant Horizons primitive classification stored in TerrainPrim.tint.w. This is separate
 // from the payload material enum because the importer still needs to distinguish source geometry
@@ -196,8 +210,11 @@ public struct EntityGeom {
     public uint64_t dispAddr;
     public float4 rigidDisp;
     public uint triBase[2];
-    public uint2 reserved;
+    public uint historyFlags;
+    public uint reserved;
 };
+
+public static const uint ENTITY_HISTORY_DYNAMIC = 1u;
 
 // TLAS instance-custom-index encoding + terrain geometry buckets (shared by rahit/rchit).
 public static const uint ENTITY_BIT = 0x800000u;

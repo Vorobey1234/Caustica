@@ -30,6 +30,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Experimental ray-traced coarse geometry sourced from DH's native render buffers. */
 public final class RtDistantHorizonsTerrain {
@@ -115,6 +116,8 @@ public final class RtDistantHorizonsTerrain {
     private boolean cpuPending;
     private boolean packPending;
     private boolean bootstrapComplete;
+    private final AtomicBoolean manualRefreshRequested = new AtomicBoolean();
+    private boolean forceSourceRebuild;
     // Refreshes are incremental and atomic: unchanged DH source meshes reuse their existing compacted
     // BLAS, changed/new meshes are built one bounded batch at a time, and the old proxy remains the sole
     // visible RT source until the replacement table is complete. This removes the raster-only hand-off
@@ -124,14 +127,36 @@ public final class RtDistantHorizonsTerrain {
     private RtDistantHorizonsTerrain() {
     }
 
+    /**
+     * Rebuild the RT proxy from DH's current source meshes on the next render frame. The published proxy
+     * remains visible until its replacement is ready, and no world-save or persistent DH cache is deleted.
+     */
+    public void requestFullRefresh() {
+        manualRefreshRequested.set(true);
+    }
+
     public void frame(RtContext ctx, int rebaseX, int rebaseY, int rebaseZ) {
+        Minecraft minecraft = Minecraft.getInstance();
+        Object newWorld = minecraft.level;
+        if (DistantHorizonsCompat.enabled() && newWorld != null
+                && manualRefreshRequested.getAndSet(false)) {
+            // Invalidate unpublished work before draining completions, so an old result cannot publish or
+            // schedule another batch between the button click and the epoch change.
+            epoch++;
+            abortBuildSession();
+            cpuPending = false;
+            anchorX = anchorZ = Integer.MIN_VALUE;
+            capturedLodRevision = -1L;
+            nextRefresh = 0L;
+            earliestBuildNanos = 0L;
+            forceSourceRebuild = true;
+            CausticaMod.LOGGER.info("Manual Distant Horizons RT proxy refresh requested");
+        }
         drainCpuCompleted(ctx);
         drainPackCompleted(ctx);
         drainCompleted(ctx);
         serviceBuildSession(ctx);
 
-        Minecraft minecraft = Minecraft.getInstance();
-        Object newWorld = minecraft.level;
         if (!DistantHorizonsCompat.enabled() || newWorld == null) {
             if (current != null || world != null) reset(ctx, true);
             return;
@@ -197,7 +222,9 @@ public final class RtDistantHorizonsTerrain {
             int proxyRadius = Math.max(vanillaRadius + CHUNK_BLOCKS, dhChunks * CHUNK_BLOCKS);
             long revision = nextRevision;
             nextRevision += 2L;
-            startCpuBuild(ax, az, proxyRadius, epoch, revision, current,
+            Proxy reuseBase = forceSourceRebuild ? null : current;
+            forceSourceRebuild = false;
+            startCpuBuild(ax, az, proxyRadius, epoch, revision, reuseBase,
                     RtMaterialRegistry.INSTANCE.requireSnapshot(), lodQuality);
         }
     }
@@ -1027,6 +1054,8 @@ public final class RtDistantHorizonsTerrain {
         lodQuality = new DistantHorizonsCompat.LodQuality(0L, 16, 2, "UNKNOWN", "UNKNOWN");
         cpuPending = false;
         bootstrapComplete = false;
+        manualRefreshRequested.set(false);
+        forceSourceRebuild = false;
         abortBuildSession();
         world = null;
         instanceProxy = null;
@@ -1070,6 +1099,8 @@ public final class RtDistantHorizonsTerrain {
         cpuPending = false;
         packPending = false;
         bootstrapComplete = false;
+        manualRefreshRequested.set(false);
+        forceSourceRebuild = false;
         DistantHorizonsCompat.clearCapturedLods();
     }
 
