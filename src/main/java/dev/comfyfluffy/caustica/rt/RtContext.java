@@ -75,8 +75,10 @@ public final class RtContext {
         this.vk = device.vkDevice();
         this.vma = vma;
         this.graphicsQueue = device.graphicsQueue();
-        this.computeQueue = new VulkanQueue(device, RtDeviceBringup.computeQueueFamilyIndex(),
-                RtDeviceBringup.computeQueueIndex());
+        this.computeQueue = RtDeviceBringup.usesSharedComputeQueue()
+                ? device.computeQueue()
+                : new VulkanQueue(device, RtDeviceBringup.computeQueueFamilyIndex(),
+                        RtDeviceBringup.computeQueueIndex());
         this.shaderGroupHandleSize = handleSize;
         this.shaderGroupBaseAlignment = baseAlign;
         this.shaderGroupHandleAlignment = handleAlign;
@@ -101,9 +103,9 @@ public final class RtContext {
         if (instance != null || unavailable) {
             return instance;
         }
-        if (!RtDeviceBringup.computeQueueReserved()) {
+        if (!RtDeviceBringup.computeQueueAvailable()) {
             unavailable = true;
-            CausticaMod.LOGGER.warn("Caustica RT disabled: no dedicated compute queue was reserved at device creation");
+            CausticaMod.LOGGER.warn("Caustica RT disabled: device creation exposed no compute-capable queue");
             return null;
         }
         instance = create(device);

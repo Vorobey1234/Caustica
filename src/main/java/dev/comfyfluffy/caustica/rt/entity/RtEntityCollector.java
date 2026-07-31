@@ -212,6 +212,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int idxStart = capture.idx.size();
         int uvStart = capture.uvList.size();
         int primStart = capture.prim.size();
+        // The template caches immutable cube topology only; it keeps ModelPart references, so
+        // translateAndRotate reads the pose just written by setupAnim for every limb this frame.
         RtCuboidEmitter.ModelTemplate directTemplate = cuboidEmitter.prepare(model);
         long directCubeCounts = 0L;
         long drawStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;

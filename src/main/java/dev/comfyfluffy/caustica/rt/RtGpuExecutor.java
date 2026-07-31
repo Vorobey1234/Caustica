@@ -33,9 +33,8 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ALL_COMMA
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
- * Single-owner asynchronous GPU submission lane on a queue reserved by Caustica at device creation.
- * Minecraft never fetches or submits to this queue index, so the executor can satisfy Vulkan's external
- * queue-synchronization rule without coordinating a host mutex with Blaze3D.
+ * Single-owner asynchronous GPU submission lane. Caustica reserves a private compute queue when the
+ * device exposes a spare handle; single-queue devices fall back to Blaze3D's compute-capable queue.
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;

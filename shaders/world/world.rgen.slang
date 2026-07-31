@@ -130,9 +130,8 @@ float cloudShadowTransmittance(float3 surfacePos, float3 lightDir) {
     return lerp(1.0, exp(-opticalDepth * 1.35), daylight * grazing);
 }
 
-// Three-point Gauss-Legendre optical-depth estimate used only by the atmospheric view integral. It
-// samples the same world-anchored cloud field as surface shadows, but avoids the six-step surface query
-// at every view segment: four view segments × three samples retains the old total density cost (12).
+// Three-point cloud optical depth for the atmosphere. This shares the cloud field used by terrain
+// shadows without an expensive six-step query at every fog segment.
 float cloudFogTransmittance(float3 samplePos, float3 lightDir, CloudParams params) {
     float daylight = smoothstep(0.01, 0.12, worldPush.sunDir.y);
     float grazing = smoothstep(0.015, 0.08, lightDir.y);
@@ -146,8 +145,7 @@ float cloudFogTransmittance(float3 samplePos, float3 lightDir, CloudParams param
             (5.0 / 9.0) * cloudDensity(samplePos + lightDir * (center - offset), params)
             + (8.0 / 9.0) * cloudDensity(samplePos + lightDir * center, params)
             + (5.0 / 9.0) * cloudDensity(samplePos + lightDir * (center + offset), params));
-    float transmittance = exp(-CLOUD_SIGMA_T * 1.20 * densityIntegral);
-    return lerp(1.0, transmittance, daylight * grazing);
+    return lerp(1.0, exp(-CLOUD_SIGMA_T * 1.20 * densityIntegral), daylight * grazing);
 }
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass).
@@ -185,14 +183,57 @@ float3 waterExtinction(float3 tint) {
 //  * Wind + meander: headings spread around a fixed wind direction (tight for the swell, wide for the
 //    chop), and the largest components' phase is modulated along their crest (chain-ruled into the
 //    gradient) so wavefronts wander instead of ruling straight periodic lines across the sea.
-// The domain is world-anchored (see applyWaterWaves) so the pattern is pinned in world space, and the
-// caustics (waterCaustic) differentiate this same field, so they stay in sync with the visible ripples.
+// The domain is world-anchored (see applyWaterWaves) so the pattern is pinned in world space. Caustics
+// differentiate only this broad base field; short rain impacts stay out of their coarse finite difference.
 static const float WATER_WAVE_STRENGTH = 0.3;  // slope scale (higher = choppier glints / more broken reflections)
 static const float WAVE_SPEED = 0.8;           // global time scale; dispersion keeps relative speeds physical
 static const int   WAVE_COUNT = 10;            // λ = 14 m … 0.38 m (each octave 1.5× shorter)
 static const float WAVE_G = 9.81;
 static const float2 WAVE_WIND = normalize(float2(1.0, 0.35)); // dominant travel direction
 static const float WAVE_MEANDER = 1.1;         // crest phase-wobble amplitude (rad) on the long components
+
+// Short-lived, world-anchored rain impacts. Their centres and timing depend only on absolute water
+// coordinates, never the camera or frame index, so actual ripple rings stay on the water rather than
+// becoming a player-following screen-space pattern.
+float rainImpactHash(int2 cell, uint salt) {
+    uint h = uint(cell.x) * 0x8da6b343u ^ uint(cell.y) * 0xd8163841u ^ salt * 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return float(h) * (1.0 / 4294967296.0);
+}
+
+float2 rainImpactGrad(float2 p, float time, float rain) {
+    if (rain < 0.01) return float2(0.0, 0.0);
+
+    const float CELL_SIZE = 1.65;
+    int2 baseCell = int2(floor(p / CELL_SIZE));
+    float2 grad = float2(0.0, 0.0);
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            int2 cell = baseCell + int2(x, y);
+            float density = rainImpactHash(cell, 1u);
+            if (density > rain * 0.58) continue;
+
+            float2 centre = (float2(cell) + float2(rainImpactHash(cell, 2u), rainImpactHash(cell, 3u)))
+                    * CELL_SIZE;
+            float period = lerp(0.68, 1.28, rainImpactHash(cell, 4u));
+            float phase = frac(time / period + rainImpactHash(cell, 5u));
+            float lifetime = smoothstep(0.03, 0.11, phase) * (1.0 - smoothstep(0.82, 1.0, phase));
+            float radius = phase * lerp(0.34, 0.58, rainImpactHash(cell, 6u));
+            float width = lerp(0.035, 0.055, rainImpactHash(cell, 7u));
+            float2 d = p - centre;
+            float distance = length(d);
+            float q = (distance - radius) / width;
+            float radialSlope = -2.0 * q * exp(-q * q) / width;
+            grad += d / max(distance, 0.02) * radialSlope * (0.00115 * rain * lifetime);
+        }
+    }
+    return grad;
+}
+
 float2 waterWaveGrad(float2 p, float t) {
     // Per-wave steepness a·k: gentle in the long swell, concentrated in the mid/short chop.
     const float Q[WAVE_COUNT] = { 0.030, 0.035, 0.042, 0.050, 0.060, 0.065, 0.065, 0.058, 0.048, 0.038 };
@@ -222,13 +263,18 @@ float2 waterWaveGrad(float2 p, float t) {
     return g * WATER_WAVE_STRENGTH;
 }
 
+float2 waterSurfaceGrad(float2 p, float t) {
+    return waterWaveGrad(p, t) + rainImpactGrad(p, worldPush.weather.w,
+            saturate(worldPush.weather.x));
+}
+
 // Perturb a (near-)horizontal water surface normal by the wave field. Flowing side faces (|n.y| small)
 // keep their flat geometric normal. `worldXZ` must be a world-stable coordinate (rebased hit + the pushed
 // anchor) so the ripples stay pinned in the world. `nGeo` is already oriented toward the viewer, so the
 // down-viewed underside (n.y < 0) takes the mirrored slope (-up).
 float3 applyWaterWaves(float3 nGeo, float2 worldXZ, float t) {
     if (abs(nGeo.y) < 0.5) return nGeo;
-    float2 grad = waterWaveGrad(worldXZ, t);
+    float2 grad = waterSurfaceGrad(worldXZ, t);
     float3 up = normalize(float3(-grad.x, 1.0, -grad.y));
     return nGeo.y >= 0.0 ? up : -up;
 }
@@ -395,22 +441,26 @@ float puddleField(float2 worldXZ) {
     return basin * 0.82 + erosion * 0.18;
 }
 
-// Blue noise texture (128x128 R8_UNORM, generated by BlueNoiseGenerator and bound by RtComposite).
-// Sampled with a golden-ratio temporal rotation so neighbouring pixels get uncorrelated seeds without
-// the structured (concentric-ring / checkerboard) artifacts a hardcoded Bayer-style table imposes on
-// flat surfaces like grass fields. Binding 10 = materialBase (9) + skySamplers (1) — see RtPipeline.create.
+// Blue-noise texture (128x128 R8_UNORM, generated by BlueNoiseGenerator and bound by RtComposite).
+// A full-resolution hash scrambles its repeated rank tile per pixel/frame, so the 128px texture period
+// cannot reappear as a screen-space ring/grid on flat terrain. Binding 10 = materialBase (9) + skySamplers
+// (1) — see RtPipeline.create.
 [[vk::binding(13, 0)]] Sampler2D blueNoiseTex;
 
 float blueNoiseRand(int2 pix, uint frame) {
     uint2 size;
     blueNoiseTex.GetDimensions(size.x, size.y);
-    // Tile the texture across the screen, then rotate the per-tile sample offset by a golden-ratio
-    // fraction each frame to break temporal aliasing. The result is high-frequency spatial noise that
-    // converges quickly under temporal accumulation and the denoiser.
+    // The texture supplies a stratified rank. The integer avalanche makes neighbouring repeated tiles
+    // independent while retaining a uniform random value for every pixel/frame.
     int2 tile = pix & int2(int(size.x) - 1, int(size.y) - 1);
-    uint rot = (frame * 167u) & 255u;
     float base = blueNoiseTex.SampleLevel(float2(tile) / float2(size), 0.0).r;
-    return frac(base + float(rot) * 0.61803398875);
+    uint h = uint(pix.x) * 0x8da6b343u ^ uint(pix.y) * 0xd8163841u ^ frame * 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return frac(base + float(h) * (1.0 / 4294967296.0));
 }
 
 float3 primaryRayDir(float2 ndc) {
@@ -618,9 +668,8 @@ float3 sampleLocalPointLighting(float3 p, float3 n, float3 v, float3 diffAlb, fl
 }
 
 float3 fogVisibility(float3 origin, float3 dir, float tmax) {
-    // a < -1.5 marks a fog-lighting ray. The DH any-hit shader ignores coarse LOD geometry for this
-    // ray type: otherwise a low-detail skyscraper casts a giant blocky silhouette through the entire
-    // atmosphere. Nearby full-resolution terrain still produces soft volumetric occlusion.
+    // A negative alpha marks an atmosphere-lighting ray so DH's coarse geometry cannot paint a
+    // skyscraper-sized hard shadow through the entire volume.
     shadowVis = float4(1.0, 1.0, 1.0, -2.0);
     HitObject hObj = HitObject::TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
@@ -629,11 +678,6 @@ float3 fogVisibility(float3 origin, float3 dir, float tmax) {
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 }
 
-// Participating medium used for rain/thunder and for clear-air dawn/dusk haze.  The previous version
-// mixed coloured transmission from shadow rays directly into the fog and integrated a very strong HDR
-// sun term at sparse control points.  That produced large green/yellow blocks and occasional hot pixels.
-// This version uses scalar visibility, bounded single scattering, more frequent visibility control points
-// and low-amplitude world-space density variation.
 float henyeyGreenstein(float cosTheta, float g) {
     float gg = g * g;
     float denom = max(1.0 + gg - 2.0 * g * cosTheta, 1.0e-4);
@@ -644,8 +688,6 @@ float fogLuminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-// Very gentle, continuous modulation.  Large-amplitude noise reads as opaque blocks when multiplied by
-// hard sun visibility, so keep this close to one and let the shadow field create the visible shafts.
 float smoothFogDensity(float3 samplePos) {
     float3 p = samplePos + float3(worldPush.waterAnchor.x, 0.0, worldPush.waterAnchor.y);
     float n = 0.50 * sin(dot(p, float3(0.0117, 0.0071, 0.0093)) + 1.7)
@@ -655,29 +697,20 @@ float smoothFogDensity(float3 samplePos) {
 }
 
 float twilightFogFactor(float sunY) {
-    // Peak near the horizon, visible a little before sunrise and after sunset, then fade smoothly toward
-    // noon and full night.  abs(sunY) makes morning/evening symmetric.
     float horizon = 1.0 - smoothstep(0.05, 0.46, abs(sunY));
     float nightGate = smoothstep(-0.18, -0.015, sunY);
     return clamp(horizon * nightGate, 0.0, 1.0);
 }
 
 float daytimeFogFactor(float sunY) {
-    // Unlike twilight haze, this stays present through the bright part of the day and fades before
-    // night. A smooth solar-elevation gate avoids a visible density switch at sunrise.
     return smoothstep(0.02, 0.40, sunY);
 }
 
 float scalarFogVisibility(float3 samplePos, float3 lightDir) {
-    float3 transmitted = fogVisibility(samplePos, lightDir, 10000.0);
-    // Coloured glass/leaves may tint ordinary surface shadows, but feeding that RGB directly into a
-    // participating medium creates giant green panes in the air. Fog uses only scalar transmittance.
-    return clamp(fogLuminance(transmitted), 0.0, 1.0);
+    return clamp(fogLuminance(fogVisibility(samplePos, lightDir, 10000.0)), 0.0, 1.0);
 }
 
 float3 fogDiskDirection(float3 axis, float2 diskOffset, float angularRadius) {
-    // Build a stable tangent frame around the celestial direction. The fallback only matters close to
-    // the pole where the celestial travel vector can become nearly parallel to the light direction.
     float3 right = cross(axis, worldPush.celestial.xyz);
     if (dot(right, right) < 1.0e-6) right = cross(axis, float3(0.0, 1.0, 0.0));
     if (dot(right, right) < 1.0e-6) right = cross(axis, float3(1.0, 0.0, 0.0));
@@ -687,15 +720,94 @@ float3 fogDiskDirection(float3 axis, float2 diskOffset, float angularRadius) {
 }
 
 float softFogVisibility(float3 samplePos, float3 lightDir, bool alternatePattern) {
-    // The near/far control points use complementary diagonal pairs. Together they still cover all four
-    // corners of the light disc, but each point needs only center + two penumbra rays instead of five.
-    // This cuts fog shadow traversal by 40% without reintroducing the old binary shaft edges.
     float angularRadius = max(tan(max(worldPush.lightDir.w, 0.0)), 0.0030);
     float center = scalarFogVisibility(samplePos, lightDir);
     float2 diagonal = alternatePattern ? float2(0.72, -0.72) : float2(0.72, 0.72);
     float pair = scalarFogVisibility(samplePos, fogDiskDirection(lightDir, diagonal, angularRadius));
     pair += scalarFogVisibility(samplePos, fogDiskDirection(lightDir, -diagonal, angularRadius));
     return clamp(center * 0.40 + pair * 0.30, 0.0, 1.0);
+}
+
+float fogStartDistance(float rain) { return 0.0; }
+
+float fogWeightedDistance(float distanceToSurface, float rain) {
+    // Any camera-centred clear radius becomes a visible sphere in distant terrain.  Uniform extinction
+    // has no shell: it starts weak at the camera and grows continuously with path length.
+    return max(distanceToSurface, 0.0);
+}
+
+// Four fixed view segments give stable single scattering: Beer–Lambert extinction, soft geometry
+// visibility and world-anchored cloud visibility. The energy is bounded by removed view radiance.
+float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToSurface,
+                              float sigmaT, float fogAmount, float rain, float thunder,
+                              float twilight, bool primarySky) {
+    float maxDistance = lerp(360.0, 480.0, rain);
+    float surfaceDistance = min(max(distanceToSurface, 0.0), maxDistance);
+    float fogStart = fogStartDistance(rain);
+    float marchDistance = max(surfaceDistance - fogStart, 0.0);
+    float opticalDistance = fogWeightedDistance(surfaceDistance, rain);
+    if (marchDistance <= 0.01 || opticalDistance <= 0.01 || sigmaT <= 1.0e-6) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float3 lightDir = normalize(worldPush.lightDir.xyz);
+    float anisotropy = lerp(0.30, 0.44, max(thunder, rain * 0.65));
+    float phaseRelative = clamp(henyeyGreenstein(clamp(dot(rayDir, lightDir), -1.0, 1.0), anisotropy)
+            * (4.0 * PI), 0.25, 2.35);
+    float3 rawLight = max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0));
+    float rawLightLum = fogLuminance(rawLight);
+    float3 lightColor = rawLightLum > 1.0e-5 ? rawLight / rawLightLum : float3(1.0, 1.0, 1.0);
+    float lightStrength = min(rawLightLum, 4.0);
+
+    float nearT = fogStart + marchDistance * 0.30;
+    float farT = fogStart + marchDistance * 0.72;
+    float nearVisibility = primarySky ? 1.0 : softFogVisibility(rayOrigin + rayDir * nearT, lightDir, false);
+    float farVisibility = primarySky ? 1.0 : softFogVisibility(rayOrigin + rayDir * farT, lightDir, true);
+    CloudParams cloudParams = sceneCloudParams();
+    float shaftIntegral = 0.0;
+    for (int segment = 0; segment < 4; ++segment) {
+        float ua = float(segment) * 0.25;
+        float ub = float(segment + 1) * 0.25;
+        float ta = fogStart + marchDistance * ua;
+        float tb = fogStart + marchDistance * ub;
+        float3 entryPos = rayOrigin + rayDir * ta;
+        float jitter = (cloudNoise2(cloudAbsoluteXZ(entryPos, cloudParams) * 0.0061
+                + float2(17.3, -9.1)) - 0.5) * 0.1125;
+        float u = clamp(0.5 * (ua + ub) + jitter, ua + 0.025, ub - 0.025);
+        float3 samplePos = rayOrigin + rayDir * (fogStart + u * marchDistance);
+        float cloudVisibility = lerp(0.06, 1.0,
+                smoothstep(0.06, 0.94, cloudFogTransmittance(samplePos, lightDir, cloudParams)));
+        float geometryVisibility = lerp(nearVisibility, farVisibility, smoothstep(0.18, 0.82, u));
+        geometryVisibility = lerp(1.0, smoothstep(0.06, 0.94, geometryVisibility), 0.25);
+        float segmentWeight = max(exp(-sigmaT * fogWeightedDistance(ta, rain))
+                - exp(-sigmaT * fogWeightedDistance(tb, rain)), 0.0);
+        shaftIntegral += segmentWeight * smoothFogDensity(samplePos) * cloudVisibility * geometryVisibility;
+    }
+
+    float totalExtinction = 1.0 - exp(-sigmaT * opticalDistance);
+    float daylight = smoothstep(-0.035, 0.10, worldPush.sunDir.y);
+    float atmosphericLight = max(daylight, twilight * 0.45);
+    float directScale = lightStrength * 0.045 * phaseRelative * shaftIntegral
+            * lerp(0.55, 1.0, fogAmount) * (primarySky ? 0.58 : 1.0)
+            * lerp(0.06, 1.0, atmosphericLight);
+    float3 direct = lightColor * directScale;
+    direct = min(max(direct, float3(0.0, 0.0, 0.0)),
+            lightColor * (0.075 + 0.11 * rain) * totalExtinction);
+
+    float3 rainAmbient = lerp(float3(0.24, 0.29, 0.36), float3(0.08, 0.09, 0.12), thunder);
+    float3 twilightAmbient = float3(0.34, 0.22, 0.15);
+    float twilightWeight = twilight * (1.0 - rain);
+    float3 ambientColor = lerp(rainAmbient, twilightAmbient, twilightWeight);
+    float clearDayWeight = daytimeFogFactor(worldPush.sunDir.y) * (1.0 - rain);
+    ambientColor = lerp(ambientColor, float3(0.38, 0.47, 0.60), 0.65 * clearDayWeight);
+    float ambientStrength = 0.13 + 0.11 * fogAmount + 0.05 * twilightWeight + 0.07 * clearDayWeight;
+    // Rain must retain a dim visible volume after sunset, without creating a grey night veil.
+    float nightFloor = 0.03 + 0.08 * rain + 0.02 * thunder;
+    ambientStrength *= lerp(nightFloor, 1.0, atmosphericLight);
+    float3 clearAmbientRadiance = ambientColor * ambientStrength;
+    float stormCoverage = saturate(worldPush.weather.z * 0.94 + rain * 0.06);
+    float3 mediumAmbient = lerp(clearAmbientRadiance, stormDeckRadiance(rayDir, rain, thunder), stormCoverage);
+    return direct + mediumAmbient * totalExtinction;
 }
 
 float rainSkyExposure(float3 surfacePos, float3 surfaceNormal) {
@@ -719,110 +831,6 @@ float rainSkyExposure(float3 surfacePos, float3 surfaceNormal) {
             normalize(float3(-SIDE_HALF, 1.0, -SIDE_TRI)), LOCAL_SKY_DISTANCE)), 0.0, 1.0);
     float aperture = centre * 0.58 + sides * 0.14;
     return smoothstep(0.18, 0.88, aperture);
-}
-
-float fogStartDistance(float rain) {
-    // Keep a compact clean bubble around the player, then let the stronger atmosphere begin nearby.
-    // Rain pulls the transition closer without ever placing fog directly on the camera.
-    return lerp(18.0, 10.0, rain);
-}
-
-float fogRampDistance(float rain) {
-    return lerp(34.0, 21.0, rain);
-}
-
-float fogWeightedDistance(float distanceToSurface, float rain) {
-    float x = max(distanceToSurface - fogStartDistance(rain), 0.0);
-    float ramp = max(fogRampDistance(rain), 1.0e-3);
-    float u = clamp(x / ramp, 0.0, 1.0);
-    // Analytic integral of smoothstep(0,1,u): ramp * (u^3 - 0.5*u^4). Density and its slope are both
-    // zero at the clear-radius boundary, so the transition cannot read as a camera-centred sphere.
-    float smoothRampIntegral = ramp * (u * u * u - 0.5 * u * u * u * u);
-    return smoothRampIntegral + max(x - ramp, 0.0);
-}
-
-float3 integrateVolumetricFog(float3 rayOrigin, float3 rayDir, float distanceToSurface,
-                              float sigmaT, float fogAmount, float rain, float thunder,
-                              float twilight, bool primarySky) {
-    float maxDistance = lerp(360.0, 480.0, rain);
-    float surfaceDistance = min(max(distanceToSurface, 0.0), maxDistance);
-    float fogStart = fogStartDistance(rain);
-    float marchDistance = max(surfaceDistance - fogStart, 0.0);
-    float opticalDistance = fogWeightedDistance(surfaceDistance, rain);
-    if (marchDistance <= 0.01 || opticalDistance <= 0.01 || sigmaT <= 1.0e-6) {
-        return float3(0.0, 0.0, 0.0);
-    }
-
-    float3 lightDir = normalize(worldPush.lightDir.xyz);
-    float anisotropy = lerp(0.30, 0.44, max(thunder, rain * 0.65));
-    float phaseRelative = clamp(henyeyGreenstein(
-            clamp(dot(rayDir, lightDir), -1.0, 1.0), anisotropy) * (4.0 * PI), 0.25, 2.35);
-
-    float3 rawLight = max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0));
-    float rawLightLum = fogLuminance(rawLight);
-    float3 lightColor = rawLightLum > 1.0e-5
-            ? rawLight / rawLightLum : float3(1.0, 1.0, 1.0);
-    float lightStrength = min(rawLightLum, 4.0);
-
-    // Geometry gets only two soft control points; cloud shafts below are integrated independently in
-    // four world-space view segments. Sky rays skip geometry queries entirely so distant buildings can
-    // never be stretched into radial silhouettes across the sky.
-    float nearT = fogStart + marchDistance * 0.30;
-    float farT = fogStart + marchDistance * 0.72;
-    float3 nearPos = rayOrigin + rayDir * nearT;
-    float3 farPos = rayOrigin + rayDir * farT;
-    float nearVisibility = primarySky ? 1.0 : softFogVisibility(nearPos, lightDir, false);
-    float farVisibility = primarySky ? 1.0 : softFogVisibility(farPos, lightDir, true);
-    CloudParams cloudParams = sceneCloudParams();
-    float shaftIntegral = 0.0;
-    for (int segment = 0; segment < 4; ++segment) {
-        float ua = float(segment) * 0.25;
-        float ub = float(segment + 1) * 0.25;
-        float ta = fogStart + marchDistance * ua;
-        float tb = fogStart + marchDistance * ub;
-        float3 entryPos = rayOrigin + rayDir * ta;
-        float stableJitter = (cloudNoise2(cloudAbsoluteXZ(entryPos, cloudParams) * 0.0061
-                + float2(17.3, -9.1)) - 0.5) * 0.1125;
-        float u = clamp(0.5 * (ua + ub) + stableJitter, ua + 0.025, ub - 0.025);
-        float3 samplePos = rayOrigin + rayDir * (fogStart + u * marchDistance);
-        float cloudVisibility = lerp(0.06, 1.0,
-                smoothstep(0.06, 0.94, cloudFogTransmittance(samplePos, lightDir, cloudParams)));
-        float geometryVisibility = lerp(nearVisibility, farVisibility, smoothstep(0.18, 0.82, u));
-        geometryVisibility = lerp(1.0, smoothstep(0.06, 0.94, geometryVisibility), 0.25);
-        float segmentWeight = max(
-                exp(-sigmaT * fogWeightedDistance(ta, rain))
-                - exp(-sigmaT * fogWeightedDistance(tb, rain)), 0.0);
-        shaftIntegral += segmentWeight * smoothFogDensity(samplePos)
-                * cloudVisibility * geometryVisibility;
-    }
-
-    float totalExtinction = 1.0 - exp(-sigmaT * opticalDistance);
-    float daylight = smoothstep(-0.035, 0.10, worldPush.sunDir.y);
-    float atmosphericLight = max(daylight, twilight * 0.45);
-    float directScale = lightStrength * 0.045 * phaseRelative * shaftIntegral
-            * lerp(0.55, 1.0, fogAmount) * (primarySky ? 0.58 : 1.0)
-            * lerp(0.06, 1.0, atmosphericLight);
-    // shaftIntegral already contains the view-segment extinction weights.
-    float3 direct = lightColor * directScale;
-    // Keep the low-frequency shaft contribution below the energy removed from the view ray, especially
-    // around a low sun where the path-tracer light value is intentionally very bright.
-    float3 directLimit = lightColor * (0.075 + 0.11 * rain) * totalExtinction;
-    direct = min(max(direct, float3(0.0, 0.0, 0.0)), directLimit);
-
-    float3 rainAmbient = lerp(float3(0.24, 0.29, 0.36), float3(0.08, 0.09, 0.12), thunder);
-    float3 twilightAmbient = float3(0.34, 0.22, 0.15);
-    float twilightWeight = twilight * (1.0 - rain);
-    float3 ambientColor = lerp(rainAmbient, twilightAmbient, twilightWeight);
-    float clearDayWeight = daytimeFogFactor(worldPush.sunDir.y) * (1.0 - rain);
-    // Day haze must add skylight as well as extinction; otherwise stronger fog merely darkens distance
-    // and remains visually indistinct against shaded terrain.
-    ambientColor = lerp(ambientColor, float3(0.38, 0.47, 0.60), 0.65 * clearDayWeight);
-    float ambientStrength = 0.13 + 0.11 * fogAmount + 0.05 * twilightWeight
-            + 0.07 * clearDayWeight;
-    // Keep clear nights genuinely black and storm nights dark instead of filling the sky with a flat
-    // grey ambient term. Dawn/dusk ramps this energy back in smoothly.
-    ambientStrength *= lerp(0.015, 1.0, atmosphericLight);
-    return direct + ambientColor * totalExtinction * ambientStrength;
 }
 
 float2 projectPrevNdc(float3 worldPos) {
@@ -991,21 +999,20 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_rough = 1.0;
                 gv_emission = 0.0;
                 gv_emissionSource = EMISSION_SOURCE_NONE;
-                gv_hitCamRel = rd * 1.0e6; // sky depth remains at infinity
-                float cloudGuideDistance = payload.motionPrev.x;
-                // Clear atmosphere is stable; moving volumetric clouds are not. Clouds deliberately do
-                // not use the sparse-resolve dynamic tag: spatially expanding one cloud ray across an
-                // already valid checkerboard tile creates the long radial streaks seen with ReBLUR.
-                gv_historyStable = cloudGuideDistance <= 0.0;
-                // Opaque cloud pixels reproject at their optical centroid, so camera translation gives
-                // them finite parallax instead of treating the moving world-anchored volume as a star.
-                gv_motionHitCamRel = cloudGuideDistance > 0.0
-                        ? (ro + rd * cloudGuideDistance - worldPush.camOffset) : gv_hitCamRel;
+                float cloudDistance = payload.motionPrev.x;
+                float3 clearSkyCamRel = rd * 1.0e6;
+                // A cloud guide must use its finite centroid for both depth and motion. Mixing a
+                // finite motion point with infinite sky depth was the reprojection mismatch behind
+                // radial streaks; clear atmosphere remains an infinite, rotation-only guide.
+                gv_hitCamRel = cloudDistance > 0.0
+                        ? ro + rd * cloudDistance - worldPush.camOffset : clearSkyCamRel;
+                // Clear atmosphere is stable; moving volumetric clouds are not.
+                gv_historyStable = cloudDistance <= 0.0;
+                gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 float2 cloudWindDelta = cloudWindWorld(worldPush.waterAnchor.w);
-                gv_motionObjDisp = cloudGuideDistance > 0.0
-                        ? float3(cloudWindDelta.x, 0.0, cloudWindDelta.y)
-                        : float3(0.0, 0.0, 0.0);
+                gv_motionObjDisp = cloudDistance > 0.0
+                        ? float3(cloudWindDelta.x, 0.0, cloudWindDelta.y) : float3(0.0, 0.0, 0.0);
             }
             L += throughput * sky; // escaped to sky
             break;
@@ -1417,9 +1424,13 @@ uint stableInterlacedPhaseIndex(uint divisor, int2 tileCoord) {
 
 int2 interlacedPhase(uint divisor, uint frameIndex, int2 tileCoord, bool jitterEnabled) {
     uint idx = stableInterlacedPhaseIndex(divisor, tileCoord);
-    if (jitterEnabled) {
-        idx = (idx + frameIndex) & (divisor - 1u);
-    }
+    // Every phase must eventually run even when Ray Budget Jitter is disabled. A permanently fixed
+    // phase leaves unsampled pixels frozen forever, which is most obvious on animated mob limbs.
+    // Jitter only decorrelates the phase order between tiles; the non-jittered path uses stride 1.
+    uint tx = uint(max(tileCoord.x, 0));
+    uint ty = uint(max(tileCoord.y, 0));
+    uint stride = jitterEnabled ? (((tx * 3u) ^ (ty * 5u)) | 1u) : 1u;
+    idx = (idx + frameIndex * stride) & (divisor - 1u);
     return interlacedPhaseFromIndex(divisor, idx);
 }
 
@@ -1445,7 +1456,7 @@ void main() {
     int2 pix;
     if (rayBudgetDivisor == 2u) {
         uint checkerParity = uint(launch.x) & 1u;
-        if (rayBudgetJitter) checkerParity ^= (pc.frameIndex & 1u);
+        checkerParity ^= (pc.frameIndex & 1u);
         int checkerY = launch.y * 2 + int(checkerParity);
         pix = int2(launch.x, min(checkerY, fullSize.y - 1));
     } else {
@@ -1490,31 +1501,24 @@ void main() {
     }
     frameRadiance /= float(spp);
     nrdHitDistance /= float(spp);
-
-    // Volumetric atmosphere is always present.  Clear weather keeps a light baseline haze at every
-    // time of day; dawn/dusk, rain and thunder smoothly strengthen it without abrupt weather switches.
-    // Debug views still bypass this below.
     float rain = clamp(worldPush.weather.x, 0.0, 1.0);
     float thunder = clamp(worldPush.weather.y, 0.0, 1.0);
     float twilight = twilightFogFactor(worldPush.sunDir.y);
     float dayHaze = daytimeFogFactor(worldPush.sunDir.y);
     float clearFogAmount = clamp(0.88 + 0.10 * twilight + 0.10 * dayHaze, 0.0, 1.0);
-    float weatherFogAmount = 1.0;
-    float fogAmount = lerp(clearFogAmount, weatherFogAmount, rain);
-    // More extinction after the clear-radius ramp gives a stronger horizon haze without washing out
-    // blocks around the player. Thunder remains the densest state.
+    float fogAmount = lerp(clearFogAmount, 1.0, rain);
     float clearSigmaT = 0.00190 + 0.00085 * twilight + 0.00130 * dayHaze;
     float weatherSigmaT = 0.0060 + 0.0050 * thunder;
     float sigmaT = lerp(clearSigmaT, weatherSigmaT, rain);
+    // The miss shader supplies the terminal atmosphere/cloud radiance. Compose one finite local medium
+    // segment in front of BOTH that sky radiance and geometry, so rainy fog has no clear-sky hole between
+    // buildings. The primary-sky branch of integrateVolumetricFog avoids geometry shadow probes and keeps
+    // its direct term bounded by the removed sky radiance.
+    bool primarySky = length(gv_normal) < 0.25;
     if (sigmaT > 1.0e-6) {
-        bool primarySky = length(gv_normal) < 0.25;
-        float distanceToGuide = length(gv_hitCamRel);
         float maxFogDistance = lerp(360.0, 480.0, rain);
-        float transmittance = exp(-sigmaT
-                * fogWeightedDistance(min(distanceToGuide, maxFogDistance), rain));
-        // Use one atmosphere for geometry, clouds and clear sky. A shared extinction/scattering path
-        // makes distant buildings converge toward the same horizon colour instead of forming three
-        // disconnected colour layers.
+        float distanceToGuide = primarySky ? maxFogDistance : length(gv_hitCamRel);
+        float transmittance = exp(-sigmaT * fogWeightedDistance(min(distanceToGuide, maxFogDistance), rain));
         frameRadiance = frameRadiance * transmittance
                 + integrateVolumetricFog(origin, dir, distanceToGuide, sigmaT, fogAmount,
                         rain, thunder, twilight, primarySky);

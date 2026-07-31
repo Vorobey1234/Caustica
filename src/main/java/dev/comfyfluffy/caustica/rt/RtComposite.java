@@ -363,7 +363,7 @@ public final class RtComposite {
     // so it remains a stationary-camera accumulator while ReLAX/ReBLUR retain history during movement.
     private boolean cameraMotionThisFrame;
     private long atlasSampler;
-    private long materialNormalSampler;
+    private long materialPageSampler;
     private boolean failed;
     private boolean loggedActive;
     private boolean loggedDhLightingReady;
@@ -690,7 +690,7 @@ public final class RtComposite {
      */
     private void bindWorldTextures(RtContext ctx) {
         long sampler = atlasSampler(ctx);
-        long normalSampler = materialNormalSampler(ctx);
+        long pageSampler = materialPageSampler(ctx);
         long atlasView = blockAlbedoAtlasView();
         boundBlockAlbedoAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
         worldPipeline.setBlockAlbedoAtlas(atlasView, sampler);
@@ -702,7 +702,7 @@ public final class RtComposite {
         RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
         worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
-        RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler, normalSampler);
+        RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler, pageSampler);
         RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
         materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
@@ -1306,16 +1306,23 @@ public final class RtComposite {
             int rayBudgetDivisor = holdOidnReference ? 1 : rayBudgetDivisor();
             boolean rayBudgetJitter = !holdOidnReference && rayBudgetDivisor > 1
                     && rayBudgetJitterEnabled();
+            // Debug views are source-buffer inspection. Reconstructing unsampled pixels here can make a
+            // sparse guide history look like a material/normal defect, so trace every debug pixel while
+            // leaving Ray Budget and Jitter unchanged for the beauty path.
+            if (debugView != 0) {
+                rayBudgetDivisor = 1;
+                rayBudgetJitter = false;
+            }
             // Raw history is strictly per native pixel and is never populated by the interlace resolve.
-            // It is therefore safe for all Ray Budget rates now that Ray Budget Jitter only rotates
-            // exact-pixel phases and never shifts the primary camera ray between Minecraft texels.
+            // It is therefore safe for all Ray Budget rates: exact-pixel phases always cycle, while the
+            // Jitter option only decorrelates their order and never shifts the camera ray between texels.
             // Progressive Infinite always accumulates its independent per-frame paths. It keeps refining
             // while the camera is stationary and resets through the existing camera-motion path.
             boolean accumEnabled = CausticaConfig.Rt.Composite.ACCUMULATION_ENABLED.value()
                     || maxBounces() == 0;
             float jitterX = 0f;
             float jitterY = 0f;
-            // Ray Budget jitter rotates the native sampling phase; it must not also move the camera
+            // Ray Budget Jitter decorrelates the native phase order; it must not also move the camera
             // ray. DLSS-RR remains the sole owner of sub-pixel camera jitter.
             if (rrPath) {
                 CausticaJitter.INSTANCE.prepare(renderW, renderH, displayW);
@@ -1336,6 +1343,7 @@ public final class RtComposite {
             // medium when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = 0b10;
             var level = Minecraft.getInstance().level;
+            boolean cameraExposedToRain = false;
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
                 // Height-aware, mirroring vanilla's own Camera.getFluidInCamera(): a plain block-granular
@@ -1346,6 +1354,8 @@ public final class RtComposite {
                 if (fs.is(FluidTags.WATER) && camY < cameraBlockPos.getY() + fs.getHeight(level, cameraBlockPos)) {
                     flags |= 0b01;
                 }
+                cameraExposedToRain = (flags & 0b01) == 0 && level.canSeeSky(cameraBlockPos)
+                        && level.isRainingAt(cameraBlockPos);
             }
             if (waterWaves()) {
                 flags |= 0b10000; // W1: animated water wave normals
@@ -1366,10 +1376,11 @@ public final class RtComposite {
             // W1 wave-domain anchor: the terrain rebase origin reduced mod 4096 (kept small for shader
             // float precision). hitPos.xz (rebased) + anchor reconstructs a world-pinned coordinate, so the
             // ripple pattern stays fixed in the world as the player moves and the rebase origin shifts.
-            // z is the live vanilla/DH transition radius read by DH any-hit every frame.
-            // Begin accepting the DH proxy exactly at the vanilla render-distance boundary. The previous
-            // +16 block margin delayed DH by one complete chunk and made the hand-off visibly too far away.
-            float dhVanillaRadius = Minecraft.getInstance().options.renderDistance().get() * 16f;
+            // z is the live camera-centred vanilla/DH ownership radius read by DH any-hit every frame.
+            // Its radius matches the CPU build seam, while the per-ray guard follows the camera between
+            // coarse proxy rebuilds and immediately rejects stale near-field DH geometry.
+            float dhVanillaRadius = Minecraft.getInstance().options.renderDistance().get() * 16f
+                    + RtDistantHorizonsTerrain.VANILLA_SEAM_GUARD_BLOCKS;
             double cloudTimeSeconds = level != null
                     ? (level.getGameTime() + Minecraft.getInstance().getDeltaTracker()
                             .getGameTimeDeltaPartialTick(false)) / 20.0
@@ -1428,6 +1439,9 @@ public final class RtComposite {
             BreakEntry[] breaking = breakingEntries(terrain);
             PointLight[] pointLights = collectPointLights(level, terrain);
             SkyPush sky = skyPush();
+            float rainLensStrength = debugView == 0 && cameraExposedToRain
+                    ? Math.clamp(sky.weather().x(), 0.0f, 1.0f)
+                    : 0.0f;
             // Index 0 replaces stale output on the first frame after a reset. Increment only after
             // taking this frame's index; disabling accumulation also discards the old sequence.
             int accumulationFrameIndex = accumEnabled ? accumFrameCounter++ : 0;
@@ -1509,9 +1523,9 @@ public final class RtComposite {
                 clearAccumulationHistory(cmd, stack);
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
             }
-            // The reference Ray Budget contract carries its phase toggle in bit 16. Both raygen and
-            // the resolve pass use this same global phase, so every native pixel is refreshed once per
-            // divisor frames while stationary-camera detail remains intact.
+            // The reference Ray Budget contract carries phase-order decorrelation in bit 16. Raygen and
+            // resolve share the same schedule; every native pixel refreshes once per divisor frames even
+            // when decorrelation is disabled, so dynamic geometry cannot freeze on an untraced phase.
             int packedDebugAndBudget = (debugView & 0xff) | (rayBudgetDivisor << 8)
                     | (rayBudgetJitter ? 0x10000 : 0);
             new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
@@ -1795,7 +1809,8 @@ public final class RtComposite {
                         (float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
                         (float) (camZ - terrain.blockZ),
                         sky.lightDir().x(), sky.lightDir().y(), sky.lightDir().z(),
-                        sky.lightRadiance().x(), sky.lightRadiance().y(), sky.lightRadiance().z(), 0.0f);
+                        sky.weather().w(), sky.lightRadiance().x(), sky.lightRadiance().y(), sky.lightRadiance().z(),
+                        rainLensStrength);
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -1920,6 +1935,8 @@ public final class RtComposite {
         }
         // Cloud cover scatters and blocks the directional source. Keep a small diffuse
         // component during storms so interiors and moonlit nights do not collapse to black.
+        // Keep enough diffuse daylight for auto exposure to meter an overcast scene without lifting
+        // the independently lit fog deck into a white veil.
         float weatherTransmission = (1.0f - 0.78f * rain) * (1.0f - 0.35f * thunder);
         rr *= weatherTransmission;
         rg *= weatherTransmission;
@@ -2213,16 +2230,16 @@ public final class RtComposite {
         cachedBlockLightY = Integer.MIN_VALUE;
         cachedBlockLightZ = Integer.MIN_VALUE;
         nextBlockLightScanFrame = 0L;
-        if (atlasSampler != 0L || materialNormalSampler != 0L) {
+        if (atlasSampler != 0L || materialPageSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();
             if (ctx != null) {
                 if (atlasSampler != 0L) VK10.vkDestroySampler(ctx.vk(), atlasSampler, null);
-                if (materialNormalSampler != 0L) {
-                    VK10.vkDestroySampler(ctx.vk(), materialNormalSampler, null);
+                if (materialPageSampler != 0L) {
+                    VK10.vkDestroySampler(ctx.vk(), materialPageSampler, null);
                 }
             }
             atlasSampler = 0L;
-            materialNormalSampler = 0L;
+            materialPageSampler = 0L;
         }
     }
 
@@ -2231,8 +2248,7 @@ public final class RtComposite {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
                         // Preserve Minecraft's pixel-art texels inside each mip, but blend adjacent mip
-                        // levels continuously. Nearest spatial filtering keeps texels crisp while linear
-                        // mip interpolation removes camera-centred rings at footprint boundaries.
+                        // levels continuously.
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
                         .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
@@ -2250,12 +2266,11 @@ public final class RtComposite {
         return atlasSampler;
     }
 
-    private long materialNormalSampler(RtContext ctx) {
-        if (materialNormalSampler == 0L) {
+    private long materialPageSampler(RtContext ctx) {
+        if (materialPageSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                        // Normal/data texels remain point sampled spatially. Adjacent semantic mips blend
-                        // continuously so their physical detail reduction cannot form distance rings.
+                        // Keep authored normal/AO texels sharp; mip levels still blend continuously.
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
                         .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
@@ -2264,14 +2279,14 @@ public final class RtComposite {
                         .minLod(0f).maxLod(16f);
                 LongBuffer p = stack.mallocLong(1);
                 if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
-                    throw new IllegalStateException("vkCreateSampler(material normals) failed");
+                    throw new IllegalStateException("vkCreateSampler(material pages) failed");
                 }
-                materialNormalSampler = p.get(0);
-                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, materialNormalSampler,
-                        "material normal sampler");
+                materialPageSampler = p.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, materialPageSampler,
+                        "material page sampler");
             }
         }
-        return materialNormalSampler;
+        return materialPageSampler;
     }
 
     private static long blockAlbedoAtlasView() {

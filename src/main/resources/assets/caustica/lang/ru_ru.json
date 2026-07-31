@@ -44,14 +44,16 @@
   "caustica.options.rt.debugView.5": "Движение",
   "caustica.options.rt.debugView.6": "Зеркальность",
   "caustica.options.rt.debugView.7": "Зеркальное движение",
+  "caustica.options.rt.debugView.8": "\u041c\u0430\u0441\u043a\u0430 \u0441\u0432\u0435\u0447\u0435\u043d\u0438\u044f",
+  "caustica.options.rt.debugView.9": "\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a \u0441\u0432\u0435\u0447\u0435\u043d\u0438\u044f",
   "caustica.options.rt.bmfrDenoiser": "Денойзер BMFR",
   "caustica.options.rt.bmfrDenoiser.tooltip": "Кросс-вендорный денойзер BMFR в реальном времени. Работает в полном разрешении экрана и сохраняет мелкие детали текстур с помощью альбедо, глубины, движения и нормалей.",
-  "caustica.options.rt.rayBudget.tooltip": "Максимальный бюджет первичных лучей на пиксель рендера. Меньшие значения сохраняют нативное разрешение, но трассируют шахматный/интерлейсный узор без bilinear upscaling. Включите Jitter, чтобы узор смещался каждый кадр и лучше сходился во времени.",
+  "caustica.options.rt.rayBudget.tooltip": "Максимальный бюджет первичных лучей на пиксель рендера. Меньшие значения сохраняют нативное разрешение и циклически обновляют каждый точный пиксель за 2–16 шахматных/интерлейсных фаз без bilinear upscaling.",
   "caustica.options.rt.rayBudget.4": "Шахматный (1/4)",
   "caustica.options.rt.rayBudget.8": "Шахматный (1/8)",
   "caustica.options.rt.rayBudget.16": "Шахматный (1/16)",
   "caustica.options.rt.rayBudgetJitter": "Jitter для Ray Budget",
-  "caustica.options.rt.rayBudgetJitter.tooltip": "За 2–16 разнесённых фаз покрывает каждый native-пиксель и смещает выборку внутри него. Небезопасное raw accumulation отключается, чтобы история не растягивалась при неподвижной камере."
+  "caustica.options.rt.rayBudgetJitter.tooltip": "Рассинхронизирует порядок точных пиксельных фаз между тайлами. Каждый native-пиксель обновляется и при выключенной опции."
   ,"caustica.options.rt.dhRefresh": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0447\u0430\u043d\u043a\u0438 Distant Horizons"
   ,"caustica.options.rt.dhRefresh.queued": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 Distant Horizons \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u0430"
   ,"caustica.options.rt.dhRefresh.rtOnly": "\u041f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 RT-\u043f\u0440\u043e\u043a\u0441\u0438 Caustica \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u0430"

@@ -60,7 +60,7 @@
   "caustica.options.rt.nrdMethod.reblur": "ReBLUR",
   "caustica.options.rt.nrdMethod.reference": "Reference",
   "caustica.options.rt.rayBudget": "Ray Budget",
-  "caustica.options.rt.rayBudget.tooltip": "Maximum primary-ray budget per render pixel. Lower values keep native render dimensions but trace a checkerboard/interlaced pattern without bilinear scaling. Enable Jitter to rotate the pattern every frame for better temporal convergence.",
+  "caustica.options.rt.rayBudget.tooltip": "Maximum primary-ray budget per render pixel. Lower values keep native render dimensions and cycle every exact pixel over 2–16 checkerboard/interlaced phases without bilinear scaling.",
   "caustica.options.rt.rayBudget.1": "Full rate (1/1)",
   "caustica.options.rt.rayBudget.2": "Checkerboard (1/2)",
   "caustica.options.rt.rayBudget.4": "Checkerboard (1/4)",
@@ -74,9 +74,9 @@
   "caustica.options.rt.realtimeDenoiserResolution": "Realtime Denoiser Resolution",
   "caustica.options.rt.realtimeDenoiserResolution.tooltip": "Input resolution used by realtime OIDN and NVIDIA NRD. Lower values use fewer pixels. Ray Budget can additionally trace rotating interlaced phases without shrinking this resolution further.",
   "caustica.options.rt.accumulation": "Accumulation Mode",
-  "caustica.options.rt.accumulation.tooltip": "When enabled, frames are accumulated over time for a cleaner image (resets on camera movement). Disable for instant response.",
+  "caustica.options.rt.accumulation.tooltip": "Beauty view only: frames are accumulated over time for a cleaner image and reset on camera movement. Debug views always show raw guide buffers.",
   "caustica.options.rt.rayBudgetJitter": "Ray Budget Jitter",
-  "caustica.options.rt.rayBudgetJitter.tooltip": "Covers every native pixel over 2–16 dephased frames and jitters samples inside each pixel. Unsafe raw accumulation is bypassed to prevent stationary-camera history stretching."
+  "caustica.options.rt.rayBudgetJitter.tooltip": "Decorrelates the exact-pixel phase order between tiles. Every native pixel is still refreshed when this is disabled."
   ,"caustica.options.rt.dhRefresh": "Reload Distant Horizons Chunks"
   ,"caustica.options.rt.dhRefresh.queued": "Distant Horizons Reload Queued"
   ,"caustica.options.rt.dhRefresh.rtOnly": "Caustica RT Proxy Reload Queued"

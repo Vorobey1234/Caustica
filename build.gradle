@@ -205,8 +205,12 @@ def generateShaderRecords = tasks.register("generateShaderRecords", GenerateShad
 tasks.named("test", Test) {
 	useJUnitPlatform()
 	jvmArgs "--enable-native-access=ALL-UNNAMED"
-	systemProperty "caustica.oidn.path", new File(rootDir.parentFile,
-			"oidn-2.5.0.x64.windows/bin/OpenImageDenoise.dll").absolutePath
+	def externalOidn = new File(rootDir.parentFile,
+			"oidn-2.5.0.x64.windows/bin/OpenImageDenoise.dll")
+	def bundledOidn = new File(rootDir,
+			"native/prebuilt/windows-x64/oidn/OpenImageDenoise.dll")
+	systemProperty "caustica.oidn.path",
+			(externalOidn.isFile() ? externalOidn : bundledOidn).absolutePath
 }
 
 sourceSets.main.java.srcDir(files(layout.buildDirectory.dir("generated/sources/shaderRecords")).builtBy(generateShaderRecords))

@@ -41,8 +41,9 @@ public final class RtDistantHorizonsTerrain {
     private static final int RAY_MASK = 0x03;
     /** Rebuilding at every chunk crossing is too expensive for multi-million-triangle DH meshes. */
     private static final int ANCHOR_BLOCKS = 256;
-    /** Keep each DH section wholly outside vanilla terrain to avoid overlap at the transition. */
-    private static final int VANILLA_SEAM_GUARD_BLOCKS = 64;
+    /** Keep DH outside vanilla terrain; shared with GPU any-hit so stale proxies cannot overlap during rebuild. */
+    // Keep a two-chunk overlap guard while allowing DH terrain to begin closer to the player.
+    public static final int VANILLA_SEAM_GUARD_BLOCKS = 32;
     private static final int CHUNK_BLOCKS = 16;
     private static final int MAX_PROXY_DISTANCE_CHUNKS = 256;
     private static final long REFRESH_NANOS = 8_000_000_000L;
@@ -214,9 +215,14 @@ public final class RtDistantHorizonsTerrain {
             anchorZ = az;
             capturedLodRevision = lodRevision;
             nextRefresh = now + refreshDelayNanos(now);
-            // Match the shader hand-off: DH starts one chunk closer than the old +CHUNK_BLOCKS seam.
+            // Capture the actual camera centre, not the coarse rebuild anchor. The GPU's per-ray seam is
+            // camera-centred, so a newly packed proxy must start with the same ownership footprint; the
+            // any-hit guard keeps that footprint live while the player moves before the next rebuild.
+            int seamCenterX = (int) Math.floor(camera.x);
+            int seamCenterZ = (int) Math.floor(camera.z);
             int vanillaRadius = minecraft.options.renderDistance().get() * CHUNK_BLOCKS
                     + VANILLA_SEAM_GUARD_BLOCKS;
+            VanillaSeam vanillaSeam = new VanillaSeam(seamCenterX, seamCenterZ, vanillaRadius);
             int dhChunks = Math.min(MAX_PROXY_DISTANCE_CHUNKS,
                     Math.max(1, DistantHorizonsCompat.renderDistanceChunks()));
             int proxyRadius = Math.max(vanillaRadius + CHUNK_BLOCKS, dhChunks * CHUNK_BLOCKS);
@@ -224,7 +230,7 @@ public final class RtDistantHorizonsTerrain {
             nextRevision += 2L;
             Proxy reuseBase = forceSourceRebuild ? null : current;
             forceSourceRebuild = false;
-            startCpuBuild(ax, az, proxyRadius, epoch, revision, reuseBase,
+            startCpuBuild(ax, az, proxyRadius, vanillaSeam, epoch, revision, reuseBase,
                     RtMaterialRegistry.INSTANCE.requireSnapshot(), lodQuality);
         }
     }
@@ -268,7 +274,7 @@ public final class RtDistantHorizonsTerrain {
         return bootstrapComplete;
     }
 
-    private void startCpuBuild(int originX, int originZ, int proxyRadius, long taskEpoch,
+    private void startCpuBuild(int originX, int originZ, int proxyRadius, VanillaSeam vanillaSeam, long taskEpoch,
                                long revision, Proxy base, RtMaterialRegistry.Snapshot materials,
                                DistantHorizonsCompat.LodQuality quality) {
         cpuPending = true;
@@ -277,10 +283,13 @@ public final class RtDistantHorizonsTerrain {
         // the render/server workers during a large LOD upload burst.
         cpuWorker.execute(() -> {
             try {
-                List<PlannedBatch> plan = planCapturedLods(originX, originZ, proxyRadius, taskEpoch, base, quality);
-                cpuCompleted.add(new CpuCompleted(taskEpoch, revision + 1L, plan, materials, null, true));
+                List<PlannedBatch> plan = planCapturedLods(originX, originZ, proxyRadius, vanillaSeam,
+                        taskEpoch, base, quality);
+                cpuCompleted.add(new CpuCompleted(taskEpoch, revision + 1L, plan, materials, vanillaSeam,
+                        null, true));
             } catch (Throwable failure) {
-                cpuCompleted.add(new CpuCompleted(taskEpoch, revision + 1L, null, materials, failure, true));
+                cpuCompleted.add(new CpuCompleted(taskEpoch, revision + 1L, null, materials, vanillaSeam,
+                        failure, true));
             }
         });
     }
@@ -291,6 +300,7 @@ public final class RtDistantHorizonsTerrain {
      * never forces a full render-distance-sized replacement.
      */
     private List<PlannedBatch> planCapturedLods(int originX, int originZ, int proxyRadius,
+                                                VanillaSeam vanillaSeam,
                                                 long taskEpoch, Proxy base,
                                                 DistantHorizonsCompat.LodQuality quality) {
         if (taskEpoch != epoch) return List.of();
@@ -334,7 +344,8 @@ public final class RtDistantHorizonsTerrain {
             selectedMeshes++;
 
             SourceState oldSource = base == null ? null : base.sources.get(mesh.key());
-            if (oldSource != null && oldSource.version == mesh.version()) {
+            if (oldSource != null && oldSource.version == mesh.version()
+                    && sourceCanReuse(mesh, base.vanillaSeam, vanillaSeam)) {
                 reusedMeshes++;
                 reusedBatches += oldSource.entries.size();
                 for (GeomEntry entry : oldSource.entries) {
@@ -344,8 +355,8 @@ public final class RtDistantHorizonsTerrain {
             }
 
             ArrayList<DhSlice> slices = new ArrayList<>();
-            appendDhSlices(mesh, mesh.opaque(), false, slices);
-            appendDhSlices(mesh, mesh.transparent(), true, slices);
+            appendDhSlices(mesh, mesh.opaque(), false, vanillaSeam, slices);
+            appendDhSlices(mesh, mesh.transparent(), true, vanillaSeam, slices);
             for (int batchIndex = 0; batchIndex < slices.size(); batchIndex++) {
                 plan.add(PlannedBatch.build(batchKey(mesh.key(), batchIndex), mesh.key(), mesh.version(),
                         mesh.originX(), mesh.originZ(), mesh.width(), mesh.dataPointWidth(),
@@ -368,6 +379,18 @@ public final class RtDistantHorizonsTerrain {
         int cx = mesh.originX() + mesh.width() / 2;
         int cz = mesh.originZ() + mesh.width() / 2;
         return Math.max(Math.abs(cx - originX), Math.abs(cz - originZ));
+    }
+
+    private static boolean sourceCanReuse(DistantHorizonsCompat.LodMesh mesh,
+                                          VanillaSeam previous, VanillaSeam next) {
+        return previous.equals(next)
+                || (meshOutsideVanillaSeam(mesh, previous) && meshOutsideVanillaSeam(mesh, next));
+    }
+
+    private static boolean meshOutsideVanillaSeam(DistantHorizonsCompat.LodMesh mesh, VanillaSeam seam) {
+        return outsideVanillaSeam(mesh.originX(), mesh.originX() + mesh.width(),
+                mesh.originZ(), mesh.originZ() + mesh.width(),
+                seam.centerX, seam.centerZ, seam.radius);
     }
 
     /**
@@ -467,15 +490,17 @@ public final class RtDistantHorizonsTerrain {
     }
 
     private static void appendDhSlices(DistantHorizonsCompat.LodMesh mesh, byte[] bytes,
-                                       boolean transparentPass, List<DhSlice> out) {
+                                       boolean transparentPass, VanillaSeam vanillaSeam, List<DhSlice> out) {
         int maxLocal = mesh.width() + 1;
         int recordsPerSlice = MAX_BUILD_QUADS;
         int byteStride = 64;
         for (int firstQuad = 0; firstQuad < bytes.length / byteStride; firstQuad += recordsPerSlice) {
             int start = firstQuad * byteStride;
             int end = (int) Math.min(bytes.length, (long) (firstQuad + recordsPerSlice) * byteStride);
-            QuadCounts counts = countDhQuads(bytes, transparentPass, maxLocal, start, end);
-            if (counts.total() != 0) out.add(new DhSlice(mesh, bytes, transparentPass, start, end, counts));
+            QuadCounts counts = countDhQuads(bytes, transparentPass, maxLocal, start, end, mesh, vanillaSeam);
+            if (counts.total() != 0) {
+                out.add(new DhSlice(mesh, bytes, transparentPass, start, end, counts, vanillaSeam));
+            }
         }
     }
 
@@ -500,8 +525,8 @@ public final class RtDistantHorizonsTerrain {
                 materials.glassId(), materials.waterId(), materials.lavaId(), materials.emissiveId(),
                 materials.emissiveGlassId());
         for (DhSlice slice : batch) {
-            decodeDhBuffer(slice.bytes, slice.transparentPass, slice.mesh, originX, originZ, packed,
-                    palette, slice.start, slice.end);
+            decodeDhBuffer(slice.bytes, slice.transparentPass, slice.mesh, originX, originZ,
+                    slice.vanillaSeam, packed, palette, slice.start, slice.end);
         }
         packed.requireComplete();
 
@@ -515,18 +540,17 @@ public final class RtDistantHorizonsTerrain {
                 new int[]{0, 0, anyHitTris, anyHitTris});
     }
 
-    private static QuadCounts countDhQuads(byte[] bytes, boolean transparentPass, int maxLocal) {
-        return countDhQuads(bytes, transparentPass, maxLocal, 0, bytes.length);
-    }
-
     private static QuadCounts countDhQuads(byte[] bytes, boolean transparentPass, int maxLocal,
-                                           int start, int end) {
+                                           int start, int end, DistantHorizonsCompat.LodMesh mesh,
+                                           VanillaSeam vanillaSeam) {
         int solid = 0;
         int emissive = 0;
         int glass = 0;
         int water = 0;
         for (int q = start; q < end; q += 64) {
-            if (!validDhQuad(bytes, q, maxLocal)) continue;
+            if (!validDhQuad(bytes, q, maxLocal) || !quadOutsideVanillaSeam(bytes, q, mesh, vanillaSeam)) {
+                continue;
+            }
             int material = bytes[q + 12] & 0xFF;
             if (material == DH_MATERIAL_AIR) {
                 continue;
@@ -568,16 +592,39 @@ public final class RtDistantHorizonsTerrain {
         return true;
     }
 
-    private static void decodeDhBuffer(byte[] bytes, boolean transparentPass,
-                                       DistantHorizonsCompat.LodMesh mesh,
-                                       int originX, int originZ, PackedMeshBuilder packed,
-                                       DhMaterialPalette palette) {
-        decodeDhBuffer(bytes, transparentPass, mesh, originX, originZ, packed, palette, 0, bytes.length);
+    private static boolean quadOutsideVanillaSeam(byte[] bytes, int q,
+                                                  DistantHorizonsCompat.LodMesh mesh,
+                                                  VanillaSeam vanillaSeam) {
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+        for (int v = 0; v < 4; v++) {
+            int p = q + v * 16;
+            int x = mesh.originX() + u16le(bytes, p);
+            int z = mesh.originZ() + u16le(bytes, p + 4);
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minZ = Math.min(minZ, z);
+            maxZ = Math.max(maxZ, z);
+        }
+        return outsideVanillaSeam(minX, maxX, minZ, maxZ,
+                vanillaSeam.centerX, vanillaSeam.centerZ, vanillaSeam.radius);
+    }
+
+    static boolean outsideVanillaSeam(int minX, int maxX, int minZ, int maxZ,
+                                      int centerX, int centerZ, int radius) {
+        long seamMinX = (long) centerX - radius;
+        long seamMaxX = (long) centerX + radius;
+        long seamMinZ = (long) centerZ - radius;
+        long seamMaxZ = (long) centerZ + radius;
+        return maxX < seamMinX || minX > seamMaxX || maxZ < seamMinZ || minZ > seamMaxZ;
     }
 
     private static void decodeDhBuffer(byte[] bytes, boolean transparentPass,
                                        DistantHorizonsCompat.LodMesh mesh,
-                                       int originX, int originZ, PackedMeshBuilder packed,
+                                       int originX, int originZ, VanillaSeam vanillaSeam,
+                                       PackedMeshBuilder packed,
                                        DhMaterialPalette palette, int start, int end) {
         if (start >= end) return;
         float[] xyz = new float[12]; // reused for every quad; the writer copies values immediately
@@ -585,7 +632,9 @@ public final class RtDistantHorizonsTerrain {
         int offsetZ = mesh.originZ() - originZ;
         int maxLocal = mesh.width() + 1;
         for (int q = start; q < end; q += 64) {
-            if (!validDhQuad(bytes, q, maxLocal)) continue;
+            if (!validDhQuad(bytes, q, maxLocal) || !quadOutsideVanillaSeam(bytes, q, mesh, vanillaSeam)) {
+                continue;
+            }
             int material = bytes[q + 12] & 0xFF;
             if (material == DH_MATERIAL_AIR) continue;
 
@@ -692,20 +741,20 @@ public final class RtDistantHorizonsTerrain {
             if (done.failure != null) {
                 CausticaMod.LOGGER.warn("Distant Horizons terrain buffer read failed", done.failure);
             } else if (done.plan != null && !done.plan.isEmpty()) {
-                queueAtomicBuild(ctx, done.plan, done.materials, done.epoch, done.revision);
+                queueAtomicBuild(ctx, done.plan, done.materials, done.vanillaSeam, done.epoch, done.revision);
             }
         }
     }
 
     private void queueAtomicBuild(RtContext ctx, List<PlannedBatch> plan,
-                                  RtMaterialRegistry.Snapshot materials,
+                                  RtMaterialRegistry.Snapshot materials, VanillaSeam vanillaSeam,
                                   long taskEpoch, long revision) {
         if (taskEpoch != epoch) return;
         if (buildSession != null || pending || packPending) {
             requestRetry();
             return;
         }
-        buildSession = new BuildSession(taskEpoch, revision, new ArrayDeque<>(plan), materials, current);
+        buildSession = new BuildSession(taskEpoch, revision, new ArrayDeque<>(plan), materials, vanillaSeam, current);
         CausticaMod.LOGGER.info(
                 "DH progressive refresh started: current RT proxy remains active while {} planned batches stream in",
                 plan.size());
@@ -946,6 +995,10 @@ public final class RtDistantHorizonsTerrain {
 
     private void maybePublishProgress(RtContext ctx, BuildSession session) {
         if (session != buildSession || session.workingEntries.isEmpty()) return;
+        // The first proxy has no complete predecessor. Publishing its early coarse batches exposes DH's
+        // camera-centred LOD rings in every RT guide/debug view. Keep raster DH until this initial proxy
+        // is complete; later refreshes can still publish progressively because they retain old geometry.
+        if (!session.publishedAny && current == null) return;
         int unpublished = session.builtCount - session.publishedBuiltCount;
         int threshold = current == null && !session.publishedAny
                 ? INITIAL_PROGRESS_BATCHES : STEADY_PROGRESS_BATCHES;
@@ -987,7 +1040,7 @@ public final class RtDistantHorizonsTerrain {
                 session.lastBuild = null;
             }
 
-            Proxy next = new Proxy(session.revision, entries, table, finished);
+            Proxy next = new Proxy(session.revision, entries, table, session.vanillaSeam, finished);
             Proxy old = current;
             current = next;
             instanceProxy = null;
@@ -1115,7 +1168,7 @@ public final class RtDistantHorizonsTerrain {
     }
 
     private record CpuCompleted(long epoch, long revision, List<PlannedBatch> plan,
-                                RtMaterialRegistry.Snapshot materials,
+                                RtMaterialRegistry.Snapshot materials, VanillaSeam vanillaSeam,
                                 Throwable failure, boolean finalBatch) {
     }
 
@@ -1142,6 +1195,7 @@ public final class RtDistantHorizonsTerrain {
         final long revision;
         final ArrayDeque<PlannedBatch> remaining;
         final RtMaterialRegistry.Snapshot materials;
+        final VanillaSeam vanillaSeam;
         final LinkedHashMap<Long, GeomEntry> workingEntries = new LinkedHashMap<>();
         final Set<Long> finalBatchKeys = new HashSet<>();
         final Set<Long> finalSourceKeys = new HashSet<>();
@@ -1158,11 +1212,12 @@ public final class RtDistantHorizonsTerrain {
         boolean coverageChanged;
 
         BuildSession(long epoch, long revision, ArrayDeque<PlannedBatch> remaining,
-                     RtMaterialRegistry.Snapshot materials, Proxy base) {
+                     RtMaterialRegistry.Snapshot materials, VanillaSeam vanillaSeam, Proxy base) {
             this.epoch = epoch;
             this.revision = revision;
             this.remaining = remaining;
             this.materials = materials;
+            this.vanillaSeam = vanillaSeam;
             if (base != null) {
                 for (GeomEntry entry : base.entries) workingEntries.put(entry.batchKey, entry);
             }
@@ -1213,6 +1268,9 @@ public final class RtDistantHorizonsTerrain {
     private record LodRect(long key, int x, int z, int width, int detailWidth) {
     }
 
+    private record VanillaSeam(int centerX, int centerZ, int radius) {
+    }
+
     private record GeomEntry(long batchKey, long sourceKey, long sourceVersion,
                              int originX, int originZ, int sourceWidth, int dataPointWidth,
                              RtSectionTable.SectionGeom geom) {
@@ -1230,7 +1288,7 @@ public final class RtDistantHorizonsTerrain {
     }
 
     private record DhSlice(DistantHorizonsCompat.LodMesh mesh, byte[] bytes, boolean transparentPass,
-                           int start, int end, QuadCounts counts) {
+                           int start, int end, QuadCounts counts, VanillaSeam vanillaSeam) {
     }
 
     private static final class SurfaceKind {
@@ -1405,11 +1463,14 @@ public final class RtDistantHorizonsTerrain {
         final List<GeomEntry> entries;
         final Map<Long, SourceState> sources;
         final RtBuffer table;
+        final VanillaSeam vanillaSeam;
 
-        Proxy(long revision, List<GeomEntry> entries, RtBuffer table, boolean sourceSetComplete) {
+        Proxy(long revision, List<GeomEntry> entries, RtBuffer table, VanillaSeam vanillaSeam,
+              boolean sourceSetComplete) {
             this.revision = revision;
             this.entries = entries;
             this.table = table;
+            this.vanillaSeam = vanillaSeam;
             HashMap<Long, ArrayList<GeomEntry>> grouped = new HashMap<>();
             for (GeomEntry entry : entries) {
                 grouped.computeIfAbsent(entry.sourceKey, ignored -> new ArrayList<>()).add(entry);

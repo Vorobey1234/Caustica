@@ -26,4 +26,16 @@ final class RtDistantHorizonsTerrainTest {
                 RtDistantHorizonsTerrain.dhGlassInterfaceAlpha(1.0f), 1.0e-6f,
                 "opaque alpha in DH's transparent VBO must use the clear-glass fallback");
     }
+
+    @Test
+    void excludesDhQuadFootprintsThatTouchVanillaTerrain() {
+        assertFalse(RtDistantHorizonsTerrain.outsideVanillaSeam(-8, 8, -8, 8, 0, 0, 64),
+                "a DH quad inside vanilla terrain must not be packed");
+        assertFalse(RtDistantHorizonsTerrain.outsideVanillaSeam(64, 80, -8, 8, 0, 0, 64),
+                "a seam-touching DH quad must not duplicate vanilla's boundary");
+        assertFalse(RtDistantHorizonsTerrain.outsideVanillaSeam(56, 72, 56, 72, 0, 0, 64),
+                "a quad crossing a seam corner must not be packed");
+        assertTrue(RtDistantHorizonsTerrain.outsideVanillaSeam(65, 80, -8, 8, 0, 0, 64),
+                "a DH quad wholly beyond vanilla terrain must remain");
+    }
 }

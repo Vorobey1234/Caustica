@@ -53,9 +53,12 @@ uint stablePhaseIndex(uint divisor, ivec2 tileCoord) {
 
 ivec2 phaseFor(uint divisor, ivec2 tileCoord) {
     uint idx = stablePhaseIndex(divisor, tileCoord);
-    if (pc.jitterEnabled != 0u) {
-        idx = (idx + pc.frameIndex) & (divisor - 1u);
-    }
+    // Keep this schedule identical to both raygen variants. Fixed phases permanently freeze pixels
+    // that are not selected, so exact native pixels always cycle; jitter only varies tile phase order.
+    uint tx = uint(max(tileCoord.x, 0));
+    uint ty = uint(max(tileCoord.y, 0));
+    uint stride = pc.jitterEnabled != 0u ? (((tx * 3u) ^ (ty * 5u)) | 1u) : 1u;
+    idx = (idx + pc.frameIndex * stride) & (divisor - 1u);
     return phaseFromIndex(divisor, idx);
 }
 
@@ -74,9 +77,7 @@ void main() {
             int pixelX = origin.x + x;
             if (pixelX >= size.x) continue;
             uint checkerParity = uint(pixelX) & 1u;
-            if (pc.jitterEnabled != 0u) {
-                checkerParity ^= (pc.frameIndex & 1u);
-            }
+            checkerParity ^= (pc.frameIndex & 1u);
             int selectedY = origin.y + int(checkerParity);
             ivec2 samplePixel = ivec2(pixelX, min(selectedY, size.y - 1));
             imageStore(validityImage, samplePixel, uvec4(1u));
@@ -91,9 +92,7 @@ void main() {
             for (int y = 0; y < 2; y++) {
                 ivec2 pixel = origin + ivec2(x, y);
                 if (pixel.y >= size.y || all(equal(pixel, samplePixel))) continue;
-                bool valid = imageLoad(validityImage, pixel).r != 0u;
-                bool dynamicHistory = imageLoad(specAlbedoImage, pixel).a < -0.5;
-                if (valid && !dynamicHistory) continue;
+                if (imageLoad(validityImage, pixel).r != 0u) continue;
                 imageStore(colorImage, pixel, color);
                 imageStore(normalImage, pixel, normal);
                 imageStore(albedoImage, pixel, albedo);
@@ -125,9 +124,7 @@ void main() {
             // Preserve a pixel once its own checkerboard phase has produced a real ray. This is the key
             // difference from nearest-neighbour tile expansion: after divisor frames (with jitter on),
             // every pixel contains native-resolution history and no block-upscaled cells remain.
-            bool valid = imageLoad(validityImage, pixel).r != 0u;
-            bool dynamicHistory = imageLoad(specAlbedoImage, pixel).a < -0.5;
-            if (valid && !dynamicHistory) continue;
+            if (imageLoad(validityImage, pixel).r != 0u) continue;
             imageStore(colorImage, pixel, color);
             imageStore(normalImage, pixel, normal);
             imageStore(albedoImage, pixel, albedo);

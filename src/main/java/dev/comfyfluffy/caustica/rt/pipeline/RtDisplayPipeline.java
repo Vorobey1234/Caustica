@@ -195,7 +195,7 @@ public final class RtDisplayPipeline {
                          float headroom, boolean dhHybridEnabled, boolean dhLightingReady,
                          long tlas, Matrix4f invViewProj,
                          float camX, float camY, float camZ, float lightX, float lightY, float lightZ,
-                         float lightR, float lightG, float lightB, float bloomStrength) {
+                         float rainTimeSeconds, float lightR, float lightG, float lightB, float rainLensStrength) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             long accelSet = accelSets.bind(ctx, tlas);
@@ -209,8 +209,10 @@ public final class RtDisplayPipeline {
             push.putInt(12, !dhHybridEnabled ? 0 : (dhLightingReady ? 2 : 1));
             invViewProj.get(16, push);
             push.putFloat(80, camX).putFloat(84, camY).putFloat(88, camZ).putFloat(92, 0f);
-            push.putFloat(96, lightX).putFloat(100, lightY).putFloat(104, lightZ).putFloat(108, 0f);
-            push.putFloat(112, lightR).putFloat(116, lightG).putFloat(120, lightB).putFloat(124, bloomStrength);
+            // Reuse the two previously unused vec4.w lanes: weather time animates screen-local drops,
+            // and rainLensStrength is pre-gated on the CPU by rain, camera exposure and debug view.
+            push.putFloat(96, lightX).putFloat(100, lightY).putFloat(104, lightZ).putFloat(108, rainTimeSeconds);
+            push.putFloat(112, lightR).putFloat(116, lightG).putFloat(120, lightB).putFloat(124, rainLensStrength);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

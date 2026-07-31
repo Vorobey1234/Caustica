@@ -145,6 +145,12 @@ public final class RtDeviceBringup {
     private static volatile int maxOpacity4StateSubdivisionLevel;
     private static volatile int computeQueueFamilyIndex = -1;
     private static volatile int computeQueueIndex = -1;
+    /**
+     * No spare queue was available at device creation, so Caustica uses the compute-capable queue
+     * selected by Blaze3D.  This is slower than the private executor queue, but is valid on GPUs
+     * which expose only one graphics+compute queue (including common Mesa/RDNA configurations).
+     */
+    private static volatile boolean sharedComputeQueueFallback;
     private static boolean loggedUnavailable;
 
     private static final VulkanPNextStruct AS_FEATURES_STRUCT = new VulkanPNextStruct(
@@ -338,6 +344,16 @@ public final class RtDeviceBringup {
         return computeQueueFamilyIndex >= 0 && computeQueueIndex >= 0;
     }
 
+    /** True when the device has either Caustica's private queue or Blaze3D's compute-capable queue. */
+    public static boolean computeQueueAvailable() {
+        return computeQueueReserved() || sharedComputeQueueFallback;
+    }
+
+    /** True when Caustica must use Blaze3D's existing compute-capable queue. */
+    public static boolean usesSharedComputeQueue() {
+        return sharedComputeQueueFallback;
+    }
+
     public static int computeQueueFamilyIndex() {
         if (!computeQueueReserved()) {
             throw new IllegalStateException("Caustica compute queue was not reserved");
@@ -363,6 +379,7 @@ public final class RtDeviceBringup {
                                            VulkanPhysicalDevice physicalDevice, MemoryStack stack) {
         computeQueueFamilyIndex = -1;
         computeQueueIndex = -1;
+        sharedComputeQueueFallback = false;
         if (!rtRequested) {
             return;
         }
@@ -406,8 +423,23 @@ public final class RtDeviceBringup {
         }
 
         if (selectedFamily < 0) {
-            CausticaMod.LOGGER.warn(
-                    "Caustica RT disabled: no spare compute-capable Vulkan queue is available");
+            // A separate queue is an optimization, not an RT requirement. Vanilla already requests a
+            // compute-capable queue when the driver has one; single-queue GPUs expose graphics+compute
+            // as the same handle and therefore have no spare slot for the private executor queue.
+            for (int family = 0; family < families.capacity(); family++) {
+                if (requestedCounts[family] > 0
+                        && (families.get(family).queueFlags() & VK10.VK_QUEUE_COMPUTE_BIT) != 0) {
+                    sharedComputeQueueFallback = true;
+                    VkQueueFamilyProperties selected = families.get(family);
+                    CausticaMod.LOGGER.warn(
+                            "Caustica RT: no spare compute queue; using Blaze3D compute-capable queue "
+                                    + "family={} (requested={}, family queues={}, flags=0x{})",
+                            family, requestedCounts[family], selected.queueCount(),
+                            Integer.toHexString(selected.queueFlags()));
+                    return;
+                }
+            }
+            CausticaMod.LOGGER.warn("Caustica RT disabled: device creation requested no compute-capable Vulkan queue");
             return;
         }
 

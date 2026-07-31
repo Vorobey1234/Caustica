@@ -534,7 +534,7 @@ public final class CausticaConfig {
             /** Sparse full-resolution primary-ray rate expressed as one checkerboard/interlaced phase per divisor. */
             public static final IntSetting RAY_BUDGET_DIVISOR =
                     clampedInt("caustica.rt.rayBudgetDivisor", "composite.ray-budget-divisor", 1, 1, 16);
-            /** Dephased exact-pixel coverage plus sub-pixel/path jitter; unsafe raw accumulation is bypassed. */
+            /** Decorrelate the exact-pixel phase order between tiles; every phase cycles either way. */
             public static final BooleanSetting RAY_BUDGET_JITTER =
                     bool("caustica.rt.rayBudgetJitter", "composite.ray-budget-jitter", false);
             public static final IntSetting MAX_BOUNCES =

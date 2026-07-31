@@ -40,14 +40,9 @@ static const float NORMAL_AO_STRENGTH = 0.5;
 static const float RAY_CONE_MIN_WIDTH = 1.0e-5;
 static const float RAY_CONE_MIN_TEXEL_FOOTPRINT = 1.0e-4;
 static const float RAY_CONE_MAX_LOD = 12.0;
-// A scalar ray cone describes the footprint perpendicular to the ray.  On a surface viewed at a
-// grazing angle that footprint stretches by roughly 1/cos(theta).  Ignoring that stretch was the main
-// source of the camera-centred circular/spiral moire pattern: the hit shader kept selecting mip 0 for
-// floors, roofs and walls that were already many texels per pixel.  The conservative correction below
-// intentionally trades a little distant texture sharpness for stable pixels.
+// A ray cone is perpendicular to its ray.  Project it onto grazing surfaces so floors and walls do
+// not stay at mip 0 long after they are minified into camera-centred moire rings.
 static const float RAY_CONE_GRAZING_COS_FLOOR = 0.12;
-// Slightly favour the higher-resolution mip. Point-sampled pixel art stays crisp while ray-cone
-// minification still prevents unbounded far-distance aliasing.
 static const float RAY_CONE_LOD_BIAS = -0.35;
 
 float2 texSizePx(Sampler2D t) {
@@ -70,9 +65,6 @@ float edgeTexelsPerWorld(float3 p0, float3 p1, float2 uv0, float2 uv1, float2 te
 }
 
 float rayConeTextureLod(uint rayCone, float2 textureSizePx, float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2) {
-    // Convert the cone diameter into a texture-space major-axis footprint.  The previous implementation
-    // used only the perpendicular cone width, which severely underestimated minification at grazing
-    // angles and produced the concentric bands visible around the camera on every textured guide view.
     float texelsPerWorld = max(edgeTexelsPerWorld(p0, p1, uv0, uv1, textureSizePx),
             max(edgeTexelsPerWorld(p1, p2, uv1, uv2, textureSizePx),
                 edgeTexelsPerWorld(p2, p0, uv2, uv0, textureSizePx)));
@@ -183,7 +175,7 @@ float4 samplePageNormalAo(uint page, float2 uv, float lod) {
 // decoded on the CPU. Authored values remain point sampled; semantic mips are selected discretely.
 Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float3 albedo,
         float3 geometricNormal, float3 p0, float3 p1, float3 p2,
-        float2 uv0, float2 uv1, float2 uv2, float3 vdir, uint packedTangentFrame,
+        float2 uv0, float2 uv1, float2 uv2, float3 vdir, uint packedTangentFrame, bool usePackedTangentFrame,
         float fallbackRoughness, float fallbackMetalness, float fallbackEmission, bool allowSss) {
     Surface surface;
     surface.normal = geometricNormal;
@@ -229,10 +221,12 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
         // continuous footprint here removes both mip-step rings and mip-0 moire while nearest spatial
         // filtering keeps the authored pixel grid crisp at close range.
         float4 normalAo = samplePageNormalAo(page, pageUv, materialLod);
-        surface.normal = packedTangentFrame != 0u
+        // Terrain stores a quad-wide TBN in flags. Reconstructing it per triangle splits the normal
+        // map at the quad diagonal. Entity frames are object-space and can be instance-rotated, so
+        // they continue through the local triangle path until their transform is supplied here.
+        surface.normal = usePackedTangentFrame && packedTangentFrame != 0u
                 ? perturbNormalPacked(geometricNormal, packedTangentFrame, vdir, normalAo, surface.ao)
-                : perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2,
-                        vdir, normalAo, surface.ao);
+                : perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2, vdir, normalAo, surface.ao);
     }
     return surface;
 }
@@ -449,7 +443,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 albedo = material == MATERIAL_GLASS
                 ? glassTransmissionFilter(baseAlbedo, entityTexel.a) : baseAlbedo;
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
-                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir, pr.aux0,
+                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir, pr.aux0, false,
                 header.params.x, header.params.y, pr.normal.w, material == MATERIAL_OPAQUE);
         n = surface.normal;
 
@@ -529,8 +523,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float4 gtex = blockAlbedoAtlas.SampleLevel(uv, blockLod);
         float3 gtexRgb = srgbToLinear(gtex.rgb);
         float3 glassAlbedo = glassTransmissionFilter(gtexRgb * tint, gtex.a);
-        Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
-                tp0, tp1, tp2, uv0, uv1, uv2, vdir, pr.flags,
+    Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
+                tp0, tp1, tp2, uv0, uv1, uv2, vdir, pr.flags, true,
                 materialHeader.params.x, materialHeader.params.y, 0.0, false);
         n = glassSurface.normal;
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
@@ -562,7 +556,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     bool nonSolid = ew >= 1.5;
     float emission = nonSolid ? ew - 2.0 : ew; // heuristic emission source (block light level)
     Surface surface = evaluateMaterial(materialHeader, uv, blockLod, payload.albedo, n,
-            tp0, tp1, tp2, uv0, uv1, uv2, vdir, pr.flags,
+            tp0, tp1, tp2, uv0, uv1, uv2, vdir, pr.flags, true,
             materialHeader.params.x, materialHeader.params.y, emission, nonSolid);
     n = surface.normal;
     payload.albedo *= surface.ao;

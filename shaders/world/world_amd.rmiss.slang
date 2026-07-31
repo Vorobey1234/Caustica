@@ -238,46 +238,66 @@ float rainStreaks(float3 dir, float time) {
     return thin * lengthFade;
 }
 
-// Deterministic front-to-back integration of the shared cloud field. A density-weighted optical
-// centroid is returned for primary-sky motion reprojection; secondary rays simply consume the colour.
+// World-stable stratified integration of the shared cloud field. A fixed midpoint lattice projects
+// density transitions into camera-centred bands, so each ray receives one stable offset at layer entry.
+// The opacity-weighted optical centroid is the primary-ray depth/motion guide.
 void compositeVolumetricClouds(inout float3 col, float3 rayOrigin, float3 rayDir, float3 sunDir,
-                               float day, float thunder, CloudParams params,
+                               float3 lightRadiance, float day, CloudParams params,
                                out float transmittance, out float cloudDistance) {
     transmittance = 1.0;
     cloudDistance = 0.0;
     float t0, t1;
     if (!cloudInterval(rayOrigin, rayDir, t0, t1)) return;
-    const int STEPS = 14;
-    float stepLength = (t1 - t0) / float(STEPS);
-    // A fixed midpoint lattice turns density transitions into camera-centred contour rings. Offset the
-    // whole stratified march with a world/cloud-stable hash of the layer entry point: the bias becomes
-    // fine stochastic detail instead of coherent circles and it advects together with the cloud field.
+    const float CLOUD_VISIBLE_DISTANCE = 1440.0;
+    float visibleT1 = min(t1, CLOUD_VISIBLE_DISTANCE);
+    if (visibleT1 <= t0 + 0.01) return;
+    float visibleSpan = visibleT1 - t0;
+    int steps = clamp(int(ceil(visibleSpan / 24.0)), 32, 64);
+    float stepLength = visibleSpan / float(steps);
     float3 entryPos = rayOrigin + rayDir * t0;
     float marchJitter = cloudHash21(floor(cloudAbsoluteXZ(entryPos, params) * 0.5));
     float3 integrated = float3(0.0, 0.0, 0.0);
     float opacitySum = 0.0;
     float distanceSum = 0.0;
+    float rain = saturate(params.weather.x);
+    float thunder = saturate(params.weather.y);
+    float overcast = saturate(params.weather.z);
     float forward = pow(max(dot(rayDir, sunDir), 0.0), 14.0);
-    float3 nightAmbient = float3(0.006, 0.010, 0.022);
-    float3 dayAmbient = lerp(float3(0.28, 0.35, 0.46), float3(0.10, 0.13, 0.18), thunder);
-    float3 ambient = lerp(nightAmbient, dayAmbient, day);
-    float3 sunTint = lerp(float3(1.0, 0.52, 0.24), float3(0.98, 0.96, 0.90),
-            clamp(sunDir.y * 3.0, 0.0, 1.0));
-    for (int i = 0; i < STEPS; ++i) {
+    float2 horizontal = rayDir.xz;
+    float horizontalLength = length(horizontal);
+    float3 horizonDir = horizontalLength > 1.0e-4
+            ? normalize(float3(horizontal.x / horizontalLength, 0.16,
+                    horizontal.y / horizontalLength)) : float3(0.0, 1.0, 0.0);
+    float3 skyUp = sharedSkyColor(float3(0.0, 1.0, 0.0), sunDir,
+            day, rain, thunder, overcast);
+    float3 skyHorizon = sharedSkyColor(horizonDir, sunDir,
+            day, rain, thunder, overcast);
+    float3 ambient = skyUp * 0.52 + skyHorizon * 0.30;
+    float stormCoverage = saturate(overcast * 0.94 + rain * 0.06);
+    ambient = lerp(ambient, stormDeckRadiance(horizonDir, rain, thunder), stormCoverage);
+    float rawLightLum = dot(max(lightRadiance, float3(0.0, 0.0, 0.0)),
+            float3(0.2126, 0.7152, 0.0722));
+    float3 lightColor = rawLightLum > 1.0e-5
+            ? max(lightRadiance, float3(0.0, 0.0, 0.0)) / rawLightLum
+            : float3(1.0, 1.0, 1.0);
+    float directStrength = min(rawLightLum, 8.0) * 0.075 * saturate(day);
+    for (int i = 0; i < steps; ++i) {
         float sampleT = t0 + (float(i) + marchJitter) * stepLength;
         float3 samplePos = rayOrigin + rayDir * sampleT;
         float density = cloudDensity(samplePos, params);
+        // Do not fade cloud opacity by camera distance: that produces a visible dome around player.
         float alpha = 1.0 - exp(-density * CLOUD_SIGMA_T * stepLength);
+        // One broad probe is enough for low-frequency self-shadowing. The former two full density
+        // evaluations per view step tripled the cost of shallow sky rays without visible extra detail.
         float sunProbe = sunDir.y > -0.02
-                ? 0.55 * cloudDensity(samplePos + sunDir * 58.0, params)
-                    + 0.45 * cloudDensity(samplePos + sunDir * 138.0, params) : 1.0;
+                ? cloudDensity(samplePos + sunDir * 96.0, params) : 1.0;
         float sunVisibility = exp(-sunProbe * 2.8);
         float heightLight = saturate((samplePos.y - CLOUD_MIN_Y) / (CLOUD_MAX_Y - CLOUD_MIN_Y));
-        float3 cloudBaseTint = lerp(float3(0.46, 0.54, 0.68), float3(1.0, 0.98, 0.92),
-                smoothstep(0.12, 0.86, heightLight));
-        float3 lighting = ambient * cloudBaseTint + sunTint * day
-                * ((0.18 + 0.72 * sunVisibility) * (0.34 + 0.34 * heightLight)
-                    + forward * sunVisibility * 0.34);
+        float3 localLighting = ambient * lerp(0.58, 0.92, heightLight)
+                + lightColor * directStrength
+                    * ((0.12 + 0.68 * sunVisibility) * (0.30 + 0.36 * heightLight)
+                        + forward * sunVisibility * 0.30);
+        float3 lighting = localLighting;
         float contribution = transmittance * alpha;
         integrated += lighting * contribution;
         opacitySum += contribution;
@@ -285,8 +305,7 @@ void compositeVolumetricClouds(inout float3 col, float3 rayOrigin, float3 rayDir
         transmittance *= 1.0 - alpha;
         if (transmittance < 0.015) break;
     }
-    // Fade the finite cloud slab into atmospheric sky near the horizon. This removes the artificial
-    // straight boundary while preserving the full cloud volume above the player.
+    // Match the normal path: avoid a fixed-height cloud shelf along shallow rays.
     float horizonBlend = smoothstep(-0.07, 0.19, rayDir.y);
     transmittance = lerp(1.0, transmittance, horizonBlend);
     integrated *= horizonBlend;
@@ -325,24 +344,18 @@ void main(inout Payload payload) {
         mdir = fl > 1.0e-4 ? float3(flat2.x / fl, 0.0, flat2.y / fl) : float3(1.0, 0.0, 0.0);
         downFade = exp(dir.y * 3.0);
     }
+    // Keep the known-good physically based atmosphere as the source of sky illumination. Replacing it
+    // with a small hand-authored palette desaturated the entire world and made sky, clouds and geometry
+    // converge to unrelated grey values.
     float3 col = atmosphere(mdir, sd);
-    // Luminance-preserving vibrance on the in-scatter only (see SKY_SATURATION).
     float lum = dot(col, float3(0.2126, 0.7152, 0.0722));
     col = max(lerp(float3(lum, lum, lum), col, SKY_SATURATION), float3(0.0, 0.0, 0.0));
     float up = clamp(dir.y, 0.0, 1.0);
     float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
     col += nightAmbient * (1.0 - day);
     col *= downFade;
-    // Keep the sky clean black at night rather than adding a procedurally bright star layer.
-
-    // Weather is driven by Minecraft's interpolated rain/thunder state. Dense cloud
-    // cover desaturates the atmosphere toward a height-dependent overcast luminance;
-    // thunder further lowers the cloud base without making the scene pitch black.
     float horizon = 1.0 - clamp(abs(dir.y), 0.0, 1.0);
-    float stormAmount = max(rain, thunder);
-    float stormDarkening = 1.0 - 0.82 * stormAmount;
-    float3 overcastSky = lerp(float3(0.008, 0.010, 0.014),
-            float3(0.028, 0.034, 0.045), horizon) * stormDarkening;
+    float3 overcastSky = stormDeckRadiance(dir, rain, thunder);
     col = lerp(col, overcastSky, saturate(overcast * 0.94 + rain * 0.06));
     CloudParams cloudParams;
     cloudParams.weather = worldPush.weather;
@@ -350,8 +363,8 @@ void main(inout Payload payload) {
     cloudParams.worldOrigin = worldPush.cloudParams.zw;
     float cloudTransmittance;
     float cloudDistance;
-    compositeVolumetricClouds(col, WorldRayOrigin(), dir, sd, day, thunder, cloudParams,
-            cloudTransmittance, cloudDistance);
+    compositeVolumetricClouds(col, WorldRayOrigin(), dir, sd, worldPush.lightRadiance.xyz,
+            day, cloudParams, cloudTransmittance, cloudDistance);
     float drops = rainStreaks(dir, worldPush.weather.w) * rain;
     col += float3(0.22, 0.24, 0.26) * drops * (0.35 + 0.65 * horizon);
 
@@ -388,8 +401,7 @@ void main(inout Payload payload) {
     payload.albedo = max(col, float3(0.0, 0.0, 0.0)); // raygen reads this as sky radiance + bounce-0 guide
     payload.hitT = -1.0;
     payload.normal = float3(0.0, 0.0, 0.0);
-    // x carries the cloud optical centroid on a miss. Raygen uses it only for primary-sky motion;
-    // closest-hit stages overwrite this lane for geometry.
+    // x holds a finite optical centroid only when the ray passed through visible cloud.
     payload.motionPrev = float3(cloudDistance, 0.0, 0.0);
     payload.f0 = float3(0.0, 0.0, 0.0);
     payload.flags = 0u;

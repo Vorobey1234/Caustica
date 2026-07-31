@@ -61,19 +61,31 @@ public final class BlueNoiseGenerator {
                     }
                 }
 
-                // Sort tile values
-                java.util.Arrays.sort(tile);
-
-                // Assign equalised values: each sample gets the center of its band
-                idx = 0;
-                for (int y = 0; y < tileSize; y++) {
-                    for (int x = 0; x < tileSize; x++) {
-                        int px = tx * tileSize + x;
-                        int py = ty * tileSize + y;
-                        float rank = tile[idx] + 0.5f; // center of the band
-                        result[py * n + px] = rank / tileSize; // normalise to [0,1)
-                        idx++;
+                // Sort source positions by their random value.  The old code
+                // wrote the sorted values back in raster order and divided by
+                // tileSize, making every tile a visible low-range gradient.
+                int[] order = new int[tile.length];
+                for (int i = 0; i < order.length; i++) {
+                    order[i] = i;
+                }
+                for (int i = 1; i < order.length; i++) {
+                    int candidate = order[i];
+                    float candidateValue = tile[candidate];
+                    int j = i - 1;
+                    while (j >= 0 && tile[order[j]] > candidateValue) {
+                        order[j + 1] = order[j];
+                        j--;
                     }
+                    order[j + 1] = candidate;
+                }
+
+                // Assign the rank back to its original pixel. Every 8x8 tile
+                // now spans the full UNORM range without a screen-space ramp.
+                for (int rank = 0; rank < order.length; rank++) {
+                    int local = order[rank];
+                    int px = tx * tileSize + local % tileSize;
+                    int py = ty * tileSize + local / tileSize;
+                    result[py * n + px] = (rank + 0.5f) / order.length;
                 }
             }
         }
