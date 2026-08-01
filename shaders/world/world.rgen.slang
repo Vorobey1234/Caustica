@@ -66,8 +66,8 @@ static bool gv_motionUseRefracted; // true when the MV tracks the refracted hit 
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 static float3 gv_motionObjDisp;
-// Primary surfaces eligible for depth/normal-validated native raw accumulation.
-static bool gv_historyStable;
+// Raw-history class: 0 unstable, 1 static/clear sky, 2 entity, 3 water.
+static uint gv_historyClass;
 // Dynamic primary pixels must not retain an old native checkerboard phase.
 static bool gv_dynamicSurface;
 
@@ -953,7 +953,7 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
 float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                  out float firstIndirectHitDistance) {
     firstIndirectHitDistance = 0.0;
-    gv_historyStable = false;
+    gv_historyClass = 0u;
     gv_dynamicSurface = false;
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
@@ -1007,7 +1007,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
                 gv_hitCamRel = cloudDistance > 0.0
                         ? ro + rd * cloudDistance - worldPush.camOffset : clearSkyCamRel;
                 // Clear atmosphere is stable; moving volumetric clouds are not.
-                gv_historyStable = cloudDistance <= 0.0;
+                gv_historyClass = cloudDistance <= 0.0 ? 1u : 0u;
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 float2 cloudWindDelta = cloudWindWorld(worldPush.waterAnchor.w);
@@ -1038,11 +1038,14 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed,
         if (bounce == 0) {
             gv_emission = payloadEmission();
             gv_emissionSource = payloadEmissionSource();
-            // Only immutable primary surfaces may enter raw accumulation. Dynamic entity poses, water
-            // waves and particles are refreshed from the current frame instead of retaining stale shapes.
-            gv_historyStable = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) == 0u
-                    && material != MATERIAL_WATER && material != MATERIAL_PARTICLE;
-            gv_dynamicSurface = !gv_historyStable;
+            bool entitySurface = (payload.flags & PAYLOAD_DYNAMIC_SURFACE) != 0u;
+            // Keep independent histories for static surfaces, entities and water. Particles remain
+            // unstable because their short-lived billboards have no reliable surface identity.
+            gv_historyClass = material == MATERIAL_PARTICLE ? 0u
+                    : material == MATERIAL_WATER ? 3u
+                    : entitySurface ? 2u : 1u;
+            gv_dynamicSurface = entitySurface
+                    || material == MATERIAL_WATER || material == MATERIAL_PARTICLE;
         }
 
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically reflect (Fresnel
@@ -1599,13 +1602,21 @@ void main() {
     bool accumEnabled = (worldPush.flags & 0x100000u) != 0u;
     float nativeSampleCount = 0.0;
     bool acceptedHistory = false;
+    // FP16 represents every integer through 2048 exactly. Pack 9-bit coarse albedo above 2-bit class.
+    uint currentAlbedoKey = uint(clamp(round(gv_albedo.r * 7.0), 0.0, 7.0))
+            | (uint(clamp(round(gv_albedo.g * 7.0), 0.0, 7.0)) << 3u)
+            | (uint(clamp(round(gv_albedo.b * 7.0), 0.0, 7.0)) << 6u);
+    uint currentHistoryState = gv_historyClass | (currentAlbedoKey << 2u); // max 2047
     if (accumEnabled && debugMode == 0u && worldPush.frameIndex > 0u) {
+        // Same-pixel reads are race-free while this dispatch updates the RW history images in place.
         float4 historySample = rawHistoryColor[pix];
         float3 prev = historySample.rgb;
         nativeSampleCount = clamp(historySample.a, 0.0, 1024.0);
         float4 previousNormalAndState = rawHistoryNormal[pix];
         float3 previousNormal = previousNormalAndState.xyz;
-        bool previousHistoryStable = previousNormalAndState.w >= 0.0;
+        uint previousHistoryState = uint(clamp(round(previousNormalAndState.w), 0.0, 2047.0));
+        uint previousHistoryClass = previousHistoryState & 3u;
+        uint previousAlbedoKey = previousHistoryState >> 2u;
         float previousDepth = rawHistoryDepth[pix];
         float currentNormalLength = length(gv_normal);
         float previousNormalLength = length(previousNormal);
@@ -1619,12 +1630,18 @@ void main() {
         float depthDifference = abs(gv_depth - previousDepth) / depthScale;
         bool finiteHistory = nativeSampleCount >= 0.5 && all(isfinite(prev)) && all(prev >= 0.0)
                 && max(prev.x, max(prev.y, prev.z)) < 32768.0;
-        // The history alpha distinguishes stable terrain/clear sky from clouds and dynamic geometry.
-        // Animated entities, water and particles never average old poses or animated surface states.
-        acceptedHistory = finiteHistory && gv_historyStable && previousHistoryStable
-                && normalAgreement >= 0.82 && depthDifference <= 0.055;
+        bool dynamicHistory = gv_historyClass >= 2u;
+        float normalThreshold = dynamicHistory ? 0.78 : 0.82;
+        float depthThreshold = dynamicHistory ? 0.065 : 0.055;
+        // Class matching prevents a moving silhouette from inheriting terrain/sky history. Dynamic
+        // surfaces keep only a short window below, while depth/normal checks reject changed poses.
+        acceptedHistory = finiteHistory && gv_historyClass != 0u
+                && previousHistoryClass == gv_historyClass
+                && previousAlbedoKey == currentAlbedoKey
+                && normalAgreement >= normalThreshold && depthDifference <= depthThreshold;
         if (acceptedHistory) {
-            float boundedCount = min(nativeSampleCount, 1023.0);
+            float historyLimit = dynamicHistory ? 4.0 : 1024.0;
+            float boundedCount = min(nativeSampleCount, historyLimit - 1.0);
             float currentWeight = 1.0 / (boundedCount + 1.0);
             frameRadiance = prev * (1.0 - currentWeight) + frameRadiance * currentWeight;
         }
@@ -1635,9 +1652,10 @@ void main() {
     float3 safeRadiance = min(frameRadiance, float3(32768.0));
     outImage[pix] = float4(safeRadiance, 1.0);
     if (accumEnabled) {
-        float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, 1024.0) : 1.0;
+        float historyLimit = gv_historyClass >= 2u ? 4.0 : 1024.0;
+        float nextCount = acceptedHistory ? min(nativeSampleCount + 1.0, historyLimit) : 1.0;
         rawHistoryColor[pix] = float4(safeRadiance, nextCount);
-        rawHistoryNormal[pix] = float4(gv_normal, gv_historyStable ? gv_rough : -1.0);
+        rawHistoryNormal[pix] = float4(gv_normal, float(currentHistoryState));
         rawHistoryDepth[pix] = gv_depth;
     }
 }

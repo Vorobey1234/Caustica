@@ -42,8 +42,8 @@ public final class RtDistantHorizonsTerrain {
     /** Rebuilding at every chunk crossing is too expensive for multi-million-triangle DH meshes. */
     private static final int ANCHOR_BLOCKS = 256;
     /** Keep DH outside vanilla terrain; shared with GPU any-hit so stale proxies cannot overlap during rebuild. */
-    // Keep a two-chunk overlap guard while allowing DH terrain to begin closer to the player.
-    public static final int VANILLA_SEAM_GUARD_BLOCKS = 32;
+    // Start DH at the vanilla render-distance boundary.
+    public static final int VANILLA_SEAM_GUARD_BLOCKS = 0;
     private static final int CHUNK_BLOCKS = 16;
     private static final int MAX_PROXY_DISTANCE_CHUNKS = 256;
     private static final long REFRESH_NANOS = 8_000_000_000L;

@@ -44,7 +44,7 @@
   "caustica.options.rt.debugView.6": "Speculare",
   "caustica.options.rt.debugView.7": "Movimento speculare",
   "caustica.options.rt.bmfrDenoiser": "BMFR Denoiser",
-  "caustica.options.rt.bmfrDenoiser.tooltip": "Cross-vendor real-time BMFR denoising at native display resolution, preserving fine texture detail with color, depth, motion, normal, and albedo guides.",
+  "caustica.options.rt.bmfrDenoiser.tooltip": "Cross-vendor real-time BMFR denoising at the selected realtime resolution, preserving fine texture detail with color, depth, motion, normal, and albedo guides.",
   "caustica.options.rt.rayBudget.tooltip": "Maximum primary-ray budget per render pixel. Lower values keep native render dimensions but trace a checkerboard/interlaced pattern without bilinear scaling. Enable Jitter to rotate the pattern every frame for better temporal convergence.",
   "caustica.options.rt.rayBudget.4": "Checkerboard (1/4)",
   "caustica.options.rt.rayBudget.8": "Checkerboard (1/8)",

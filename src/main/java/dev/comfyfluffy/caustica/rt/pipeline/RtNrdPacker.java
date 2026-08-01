@@ -16,7 +16,7 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
 /** Converts Caustica's HW-depth beauty AOV into NRD's radiance+hit-distance and linear view-Z inputs. */
 final class RtNrdPacker {
-    private static final int IMAGE_COUNT = 7;
+    private static final int IMAGE_COUNT = 9;
     private final RtContext ctx;
     private final long descriptorSetLayout, descriptorPool, descriptorSet, pipelineLayout, pipeline;
 
@@ -61,12 +61,14 @@ final class RtNrdPacker {
 
     void dispatch(VkCommandBuffer cmd, RtImage color, RtImage depth, RtImage sourceNormalRoughness,
                   RtImage signal, RtImage packedNormalRoughness, RtImage viewZ,
-                  RtImage diffuseAlbedoAndNrdHitDistance,
+                  RtImage diffuseAlbedoAndNrdHitDistance, RtImage specularAlbedo,
+                  RtImage relaxResidual,
                   Matrix4fc inverseProjection, int method) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer infos = VkDescriptorImageInfo.calloc(IMAGE_COUNT, stack);
             long[] views = {color.view, depth.view, sourceNormalRoughness.view, signal.view,
-                    packedNormalRoughness.view, viewZ.view, diffuseAlbedoAndNrdHitDistance.view};
+                    packedNormalRoughness.view, viewZ.view, diffuseAlbedoAndNrdHitDistance.view,
+                    specularAlbedo.view, relaxResidual.view};
             for (int i = 0; i < IMAGE_COUNT; i++) infos.get(i).imageView(views[i])
                     .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(IMAGE_COUNT, stack);

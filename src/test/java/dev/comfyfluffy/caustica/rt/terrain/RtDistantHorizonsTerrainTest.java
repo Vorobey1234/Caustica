@@ -8,6 +8,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class RtDistantHorizonsTerrainTest {
     @Test
+    void startsDistantHorizonsAtTheVanillaRenderDistance() {
+        assertEquals(0, RtDistantHorizonsTerrain.VANILLA_SEAM_GUARD_BLOCKS);
+    }
+
+    @Test
     void recognizesDistantHorizonsEmissiveMaterialIndices() {
         assertTrue(RtDistantHorizonsTerrain.isDhEmissiveMaterial(6), "lava must emit");
         assertTrue(RtDistantHorizonsTerrain.isDhEmissiveMaterial(15), "illuminated material must emit");

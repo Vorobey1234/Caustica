@@ -73,6 +73,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtBmfrDenoiser;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDenoiserPlan;
 import dev.comfyfluffy.caustica.rt.pipeline.RtNrdDenoiser;
 import dev.comfyfluffy.caustica.rt.pipeline.RtOidnDenoiser;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSpatialDenoiser;
@@ -582,7 +583,9 @@ public final class RtComposite {
                 oidnReferenceHeld = false;
                 CausticaMod.LOGGER.info("Released held OIDN reference frame after camera movement");
             }
-            if (CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value()) {
+            if (CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value()
+                    || CausticaConfig.Rt.Denoiser.NRD_ENABLED.value()
+                    || CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value()) {
                 oidnReferenceHeld = false;
             }
             boolean referenceRequest = CausticaConfig.Rt.Denoiser.OIDN_ENABLED.value();
@@ -897,24 +900,18 @@ public final class RtComposite {
     }
 
     private void ensureOutput(RtContext ctx, int width, int height) {
-        // Reference OIDN is native resolution. The real-time OIDN and NRD paths trace/filter at the
-        // user-selected linear resolution and use the existing GPU fallback upscale.
-        boolean oidnRealtime = CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value();
-        boolean oidnReference = (CausticaConfig.Rt.Denoiser.OIDN_ENABLED.value() || oidnReferenceHeld)
-                && !oidnRealtime;
-        boolean bmfrEnabled = CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value();
-        boolean nrdEnabled = CausticaConfig.Rt.Denoiser.NRD_ENABLED.value() && !bmfrEnabled;
-        // BMFR is deliberately native-resolution. Feeding Minecraft's pixel-art textures through the
-        // shared 50% realtime-denoiser path and then linearly stretching them made the entire scene
-        // look soft even when the regression itself preserved an edge. Only OIDN realtime and NRD use
-        // the user-selectable reduced input resolution.
-        boolean reducedResolutionDenoiser = oidnRealtime || nrdEnabled;
-        boolean realtimeDenoiser = reducedResolutionDenoiser || bmfrEnabled;
-        int denoiserPercent = reducedResolutionDenoiser
-                ? Math.clamp(CausticaConfig.Rt.Denoiser.REALTIME_RESOLUTION_PERCENT.value(), 25, 100)
-                : 100;
-        boolean rrEnabled = RtDlssRr.enabled() && !oidnReference && !oidnRealtime
-                && !nrdEnabled && !bmfrEnabled;
+        // Reference OIDN remains a native-resolution terminal mode. Every realtime stage shares the
+        // selected input resolution, then the fixed BMFR -> NRD -> OIDN chain is point-upscaled once.
+        RtDenoiserPlan plan = RtDenoiserPlan.create(true,
+                CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value(),
+                CausticaConfig.Rt.Denoiser.NRD_ENABLED.value(),
+                CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value(),
+                CausticaConfig.Rt.Denoiser.OIDN_ENABLED.value(), oidnReferenceHeld,
+                RtDlssRr.enabled());
+        boolean realtimeDenoiser = plan.anyRealtime();
+        int denoiserPercent = plan.renderPercent(
+                CausticaConfig.Rt.Denoiser.REALTIME_RESOLUTION_PERCENT.value());
+        boolean rrEnabled = plan.dlssRr();
         int sizeMode = realtimeDenoiser ? 2 : (rrEnabled ? 1 : 0);
         int rrQuality = rrEnabled ? RtDlssRr.quality() : Integer.MIN_VALUE;
         if (output != null && displayImage != null && distantHorizonsBackground != null
@@ -1288,19 +1285,19 @@ public final class RtComposite {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
             // Jitter is suppressed for the no-RR reference and for the debug guide views (raw inspection).
             int debugView = debugView();
-            boolean bmfrRequested = CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value() && debugView == 0;
-            boolean nrdRequested = CausticaConfig.Rt.Denoiser.NRD_ENABLED.value()
-                    && !bmfrRequested && debugView == 0;
-            boolean oidnRealtimeRequested = CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value()
-                    && !bmfrRequested && !nrdRequested && debugView == 0;
-            boolean oidnReferenceRequested = CausticaConfig.Rt.Denoiser.OIDN_ENABLED.value()
-                    && !bmfrRequested && !nrdRequested && !oidnRealtimeRequested && debugView == 0;
-            boolean holdOidnReference = oidnReferenceHeld && !bmfrRequested && !oidnReferenceRequested
-                    && !oidnRealtimeRequested && debugView == 0;
+            RtDenoiserPlan denoiserPlan = RtDenoiserPlan.create(debugView == 0,
+                    CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value(),
+                    CausticaConfig.Rt.Denoiser.NRD_ENABLED.value(),
+                    CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value(),
+                    CausticaConfig.Rt.Denoiser.OIDN_ENABLED.value(), oidnReferenceHeld,
+                    RtDlssRr.enabled());
+            boolean bmfrRequested = denoiserPlan.bmfr();
+            boolean nrdRequested = denoiserPlan.nrd();
+            boolean oidnRealtimeRequested = denoiserPlan.oidnRealtime();
+            boolean oidnReferenceRequested = denoiserPlan.oidnReferenceRequested();
+            boolean holdOidnReference = denoiserPlan.oidnReferenceHeld();
             boolean oidnRequested = oidnRealtimeRequested || oidnReferenceRequested || holdOidnReference;
-            // OIDN and BMFR are alternative beauty denoisers, so do not run DLSS-RR over either one.
-            boolean rrPath = RtDlssRr.enabled() && debugView == 0 && !oidnRequested
-                    && !nrdRequested && !bmfrRequested;
+            boolean rrPath = denoiserPlan.dlssRr();
             // Resolve the effective sparse policy once and use it for jitter, flags, history resets,
             // dispatch, and reconstruction. Reference OIDN deliberately overrides both controls.
             int rayBudgetDivisor = holdOidnReference ? 1 : rayBudgetDivisor();
@@ -1617,7 +1614,7 @@ public final class RtComposite {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "NRD " + nrdMethod);
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.nrd")) {
                     nrdDone = nrdDenoiser.dispatch(ctx, cmd, renderW, renderH,
-                            output, gDepth, gMotion, gNormal, gAlbedo,
+                            output, gDepth, gMotion, gNormal, gAlbedo, gSpecAlbedo,
                             frameProjection, previousProjection, frameViewRotation, previousView,
                             (int) frameCounter, !nrdHasPrevious || referenceCameraReset || pauseStateChanged);
                 }
@@ -1640,9 +1637,8 @@ public final class RtComposite {
                 nrdPauseStateKnown = false;
             }
 
-            // OIDN consumes the complete path-traced beauty AOV, unlike FidelityFX Denoiser's specialized
-            // shadow/reflection signals. Capture this frame's raw HDR color + first-hit guides before any
-            // built-in filtering. A prepared preceding result is used only for an unchanged camera.
+            // OIDN consumes the current HDR beauty result plus first-hit guides, so when multiple
+            // realtime stages are enabled it naturally follows BMFR and NRD.
             boolean oidnReady = false;
             if (!rrDone && oidnRequested) {
                 if (holdOidnReference) {
@@ -1670,8 +1666,12 @@ public final class RtComposite {
                     oidnHistoryCopy.get(0).srcSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);
                     oidnHistoryCopy.get(0).dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);
                     oidnHistoryCopy.get(0).extent().set(renderW, renderH, 1);
-                    VK10.vkCmdCopyImage(cmd, output.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
-                            temporalHistory.image, VK10.VK_IMAGE_LAYOUT_GENERAL, oidnHistoryCopy);
+                    // BMFR owns the color history while active; replacing it with the later OIDN result
+                    // would feed the wrong stage into BMFR on the next frame.
+                    if (!bmfrRequested) {
+                        VK10.vkCmdCopyImage(cmd, output.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                                temporalHistory.image, VK10.VK_IMAGE_LAYOUT_GENERAL, oidnHistoryCopy);
+                    }
                     VK10.vkCmdCopyImage(cmd, gDepth.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                             temporalDepthHistory.image, VK10.VK_IMAGE_LAYOUT_GENERAL, oidnHistoryCopy);
                     VK10.vkCmdCopyImage(cmd, gNormal.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
@@ -2247,9 +2247,9 @@ public final class RtComposite {
         if (atlasSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                        // Preserve Minecraft's pixel-art texels inside each mip, but blend adjacent mip
-                        // levels continuously.
-                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
+                        // Preserve crisp close-up pixel art, but bilinearly minify within each mip so
+                        // the ray-cone LOD field cannot turn texture aliasing into camera-centred rings.
+                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_LINEAR)
                         .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
@@ -2270,8 +2270,9 @@ public final class RtComposite {
         if (materialPageSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                        // Keep authored normal/AO texels sharp; mip levels still blend continuously.
-                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
+                        // Smooth minified material data within each mip; nearest magnification keeps
+                        // authored normal/AO texels sharp at close range.
+                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_LINEAR)
                         .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)

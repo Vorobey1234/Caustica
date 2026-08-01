@@ -669,10 +669,10 @@ public final class CausticaConfig {
                     string("caustica.rt.denoiser.nrdMethod", "denoiser.nrd-method", "relax",
                             value -> "reference".equalsIgnoreCase(value) ? "reference"
                                     : "reblur".equalsIgnoreCase(value) ? "reblur" : "relax");
-            /** Fast OIDN preview at half linear resolution, upscaled on the GPU. */
+            /** Fast OIDN preview at the shared realtime resolution, upscaled on the GPU. */
             public static final BooleanSetting OIDN_REALTIME_ENABLED =
                     bool("caustica.rt.denoiser.oidnRealtime", "denoiser.oidn-realtime-enabled", false);
-            /** Shared input resolution for the realtime OIDN and NRD paths. */
+            /** Shared input resolution for the BMFR, NRD, and realtime OIDN chain. */
             public static final IntSetting REALTIME_RESOLUTION_PERCENT =
                     clampedInt("caustica.rt.denoiser.realtimeResolutionPercent",
                             "denoiser.realtime-resolution-percent", 50, 25, 100);

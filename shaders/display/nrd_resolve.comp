@@ -9,13 +9,13 @@ layout(binding = 0, rgba16f) uniform readonly image2D signal;
 layout(binding = 1, r32f) uniform readonly image2D linearViewZ;
 layout(binding = 2, rgba16f) uniform readonly image2D denoised;
 layout(binding = 3, rgba16f) uniform writeonly image2D outputColor;
+layout(binding = 4, rgba16f) uniform readonly image2D diffuseAlbedoAndNrdHitDistance;
+layout(binding = 5, rgba16f) uniform readonly image2D relaxResidual;
 
 layout(push_constant) uniform Push {
     float denoisingRange;
     int method; // 0 = ReLAX, 1 = ReBLUR, 2 = Reference
 } pc;
-
-const float RELAX_RADIANCE_SCALE = 1.0 / 512.0;
 
 vec3 yCoCgToLinear(vec3 color) {
     float t = color.x - color.z;
@@ -28,11 +28,16 @@ void main() {
     if (any(greaterThanEqual(pixel, size))) return;
 
     float viewZ = imageLoad(linearViewZ, pixel).r;
-    vec3 color = pc.method == 2 || abs(viewZ) < pc.denoisingRange
+    bool validNrdPixel = abs(viewZ) < pc.denoisingRange;
+    vec3 color = pc.method == 2 || validNrdPixel
             ? imageLoad(denoised, pixel).rgb
             : imageLoad(signal, pixel).rgb;
     if (pc.method == 1) color = yCoCgToLinear(color);
-    if (pc.method == 0) color /= RELAX_RADIANCE_SCALE;
+    if (pc.method == 0 && validNrdPixel) {
+        vec3 diffuseAlbedo = clamp(imageLoad(diffuseAlbedoAndNrdHitDistance, pixel).rgb,
+                vec3(0.0), vec3(1.0));
+        color = color * diffuseAlbedo + imageLoad(relaxResidual, pixel).rgb;
+    }
     // Caustica's beauty output is opaque. Keeping alpha deterministic also prevents a stale
     // alpha channel from being interpreted by later compositing passes.
     imageStore(outputColor, pixel, vec4(color, 1.0));

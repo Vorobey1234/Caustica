@@ -18,7 +18,7 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
  * NRD intentionally leaves rays that miss the scene unwritten; copying its whole output made the sky black.
  */
 final class RtNrdResolver {
-    private static final int IMAGE_COUNT = 4;
+    private static final int IMAGE_COUNT = 6;
     private final RtContext ctx;
     private final long descriptorSetLayout, descriptorPool, descriptorSet, pipelineLayout, pipeline;
 
@@ -71,10 +71,11 @@ final class RtNrdResolver {
     }
 
     void dispatch(VkCommandBuffer cmd, RtImage signal, RtImage viewZ, RtImage denoised, RtImage output,
-                  int method) {
+                  RtImage diffuseAlbedoAndNrdHitDistance, RtImage relaxResidual, int method) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer infos = VkDescriptorImageInfo.calloc(IMAGE_COUNT, stack);
-            long[] views = {signal.view, viewZ.view, denoised.view, output.view};
+            long[] views = {signal.view, viewZ.view, denoised.view, output.view,
+                    diffuseAlbedoAndNrdHitDistance.view, relaxResidual.view};
             for (int i = 0; i < IMAGE_COUNT; i++) infos.get(i).imageView(views[i]).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(IMAGE_COUNT, stack);
             for (int i = 0; i < IMAGE_COUNT; i++) {

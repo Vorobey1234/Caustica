@@ -220,24 +220,6 @@ float3 stars(float3 dir, float starBrightness, float VdotS, float4 celestial) {
     return 0.2 * star * starCol * starBrightness;
 }
 
-// Sparse world-space precipitation visible on rays that escape to the sky. The
-// longitude/latitude grid keeps drops fixed in world direction while the vertical
-// phase falls with time; temporal denoising then integrates their thin coverage.
-float rainStreaks(float3 dir, float time) {
-    float2 uv = float2(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5,
-            asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5);
-    float2 grid = uv * float2(240.0, 72.0);
-    grid.y += time * 22.0;
-    float2 cell = floor(grid);
-    float2 local = frac(grid);
-    float random = hash13(float3(cell, floor(time * 0.25)));
-    if (random < 0.965) return 0.0;
-    float center = 0.15 + 0.7 * hash13(float3(cell + 17.0, 3.0));
-    float thin = 1.0 - smoothstep(0.008, 0.035, abs(local.x - center));
-    float lengthFade = smoothstep(0.0, 0.18, local.y) * (1.0 - smoothstep(0.72, 1.0, local.y));
-    return thin * lengthFade;
-}
-
 // World-stable stratified integration of the shared cloud field. A fixed midpoint lattice projects
 // density transitions into camera-centred bands, so each ray receives one stable offset at layer entry.
 // The opacity-weighted optical centroid is the primary-ray depth/motion guide.
@@ -367,9 +349,6 @@ void main(inout Payload payload) {
     float cloudDistance;
     compositeVolumetricClouds(col, WorldRayOrigin(), dir, sd, worldPush.lightRadiance.xyz,
             day, cloudParams, cloudTransmittance, cloudDistance);
-    float drops = rainStreaks(dir, worldPush.weather.w) * rain;
-    col += float3(0.22, 0.24, 0.26) * drops * (0.35 + 0.65 * horizon);
-
     // Sun & moon discs — sampled from the vanilla celestials atlas, gated to rays that haven't already
     // accounted for the light via diffuse NEE. squareBody gives the body-local [-1,1] coord; the
     // sprite's own texel coverage (alpha) shapes the disc.

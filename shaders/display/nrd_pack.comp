@@ -9,6 +9,8 @@ layout(binding = 3, rgba16f) uniform writeonly image2D radianceHitDistance;
 layout(binding = 4, rgba16f) uniform writeonly image2D packedNormalRoughness;
 layout(binding = 5, r32f) uniform writeonly image2D linearViewZ;
 layout(binding = 6, rgba16f) uniform readonly image2D diffuseAlbedoAndNrdHitDistance;
+layout(binding = 7, rgba16f) uniform readonly image2D sourceSpecularAlbedo;
+layout(binding = 8, rgba16f) uniform writeonly image2D relaxResidual;
 
 layout(push_constant) uniform Push {
     mat4 inverseProjection;
@@ -18,9 +20,6 @@ layout(push_constant) uniform Push {
 // NRD deliberately does not write pixels outside denoisingRange.  Keep this well below
 // FP16's maximum so the resolve pass can reliably distinguish a sky/miss from geometry.
 const float NRD_DENOISING_RANGE = 50000.0;
-// RELAX stores luminance moments in FP16. Caustica's unexposed HDR beauty can be much brighter
-// than RELAX's supported [0, 250] range, so keep its input below 128 and restore the scale later.
-const float RELAX_RADIANCE_SCALE = 1.0 / 512.0;
 
 vec3 linearToYCoCg(vec3 color) {
     return vec3(dot(color, vec3(0.25, 0.5, 0.25)),
@@ -51,7 +50,23 @@ void main() {
     else viewZ = clamp(viewZ, 0.0, NRD_DENOISING_RANGE - 1.0);
 
     vec3 radiance = clamp(imageLoad(noisyColor, pixel).rgb, vec3(0.0), vec3(65504.0));
-    if (pc.method == 0) radiance *= RELAX_RADIANCE_SCALE;
+    if (pc.method == 0 && viewZ < NRD_DENOISING_RANGE) {
+        // ReLAX_DIFFUSE must not filter metallic/specular/emissive energy as diffuse radiance.
+        vec3 diffuseAlbedo = clamp(imageLoad(diffuseAlbedoAndNrdHitDistance, pixel).rgb,
+                vec3(0.0), vec3(1.0));
+        vec3 specularAlbedo = clamp(imageLoad(sourceSpecularAlbedo, pixel).rgb,
+                vec3(0.0), vec3(1.0));
+        vec3 diffuseShare = diffuseAlbedo / max(diffuseAlbedo + specularAlbedo, vec3(1.0e-6));
+        vec3 diffuseBeauty = radiance * diffuseShare;
+        vec3 materialFactor = max(diffuseAlbedo, vec3(1.0 / 255.0));
+        vec3 filteredDiffuse = clamp(diffuseBeauty / materialFactor, vec3(0.0), vec3(250.0));
+        vec3 nonDiffuseRemainder = radiance - diffuseBeauty;
+        vec3 clampOverflow = max(diffuseBeauty - filteredDiffuse * materialFactor, vec3(0.0));
+        vec3 albedoFloorRemainder = filteredDiffuse * (materialFactor - diffuseAlbedo);
+        imageStore(relaxResidual, pixel,
+                vec4(nonDiffuseRemainder + clampOverflow + albedoFloorRemainder, 1.0));
+        radiance = filteredDiffuse;
+    }
     vec4 sourceGuide = imageLoad(sourceNormalRoughness, pixel);
     imageStore(packedNormalRoughness, pixel,
             vec4(packNrdNormal(sourceGuide.rgb), clamp(sourceGuide.a, 0.0, 1.0)));

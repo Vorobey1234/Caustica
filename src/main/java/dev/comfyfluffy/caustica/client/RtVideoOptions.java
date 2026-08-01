@@ -180,11 +180,7 @@ public final class RtVideoOptions {
                 CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.value(),
                 enabled -> {
                     CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(enabled);
-                    if (enabled) {
-                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(false);
-                    }
+                    if (enabled) CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
                 });
     }
 
@@ -196,11 +192,7 @@ public final class RtVideoOptions {
                 CausticaConfig.Rt.Denoiser.BMFR_ENABLED.value(),
                 enabled -> {
                     CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(enabled);
-                    if (enabled) {
-                        CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
-                    }
+                    if (enabled) CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
                 });
     }
 
@@ -211,11 +203,7 @@ public final class RtVideoOptions {
                 CausticaConfig.Rt.Denoiser.NRD_ENABLED.value(),
                 enabled -> {
                     CausticaConfig.Rt.Denoiser.NRD_ENABLED.set(enabled);
-                    if (enabled) {
-                        CausticaConfig.Rt.Denoiser.OIDN_REALTIME_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
-                        CausticaConfig.Rt.Denoiser.BMFR_ENABLED.set(false);
-                    }
+                    if (enabled) CausticaConfig.Rt.Denoiser.OIDN_ENABLED.set(false);
                 });
     }
 

@@ -30,6 +30,7 @@ public final class RtNrdDenoiser {
     private RtImage nrdNormalRoughness;
     private RtImage viewZ;
     private RtImage denoised;
+    private RtImage relaxResidual;
     private NrdLibrary library;
     private MemorySegment nativeContext = MemorySegment.NULL;
     private int width = -1, height = -1;
@@ -44,6 +45,7 @@ public final class RtNrdDenoiser {
     public boolean dispatch(RtContext ctx, VkCommandBuffer cmd, int width, int height,
                             RtImage noisyColor, RtImage hardwareDepth, RtImage motion,
                             RtImage normalRoughness, RtImage diffuseAlbedoAndNrdHitDistance,
+                            RtImage specularAlbedo,
                             Matrix4fc projection, Matrix4fc previousProjection,
                             Matrix4fc worldToView, Matrix4fc previousWorldToView, int frameIndex,
                             boolean resetHistory) {
@@ -52,7 +54,7 @@ public final class RtNrdDenoiser {
             int method = selectedMethod();
             boolean methodChanged = method != lastMethod;
             packer.dispatch(cmd, noisyColor, hardwareDepth, normalRoughness, signal, nrdNormalRoughness, viewZ,
-                    diffuseAlbedoAndNrdHitDistance,
+                    diffuseAlbedoAndNrdHitDistance, specularAlbedo, relaxResidual,
                     inverseProjection.set(projection).invert(), method);
             barrier(cmd);
             try (Arena arena = Arena.ofConfined()) {
@@ -72,7 +74,8 @@ public final class RtNrdDenoiser {
             barrier(cmd);
             // NRD never writes sky/miss pixels. Resolve valid NRD pixels selectively instead of
             // copying undefined output over the ray-traced sky.
-            resolver.dispatch(cmd, signal, viewZ, denoised, noisyColor, method);
+            resolver.dispatch(cmd, signal, viewZ, denoised, noisyColor,
+                    diffuseAlbedoAndNrdHitDistance, relaxResidual, method);
             barrier(cmd);
             return true;
         } catch (Throwable t) {
@@ -101,6 +104,8 @@ public final class RtNrdDenoiser {
             viewZ = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "NRD linear view-Z");
             denoised = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     "NRD output");
+            relaxResidual = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    "NRD ReLAX residual");
             var device = ctx.vk();
             var physical = device.getPhysicalDevice();
             nativeContext = library.create(physical.getInstance().address(), physical.address(), device.address(),
@@ -135,9 +140,10 @@ public final class RtNrdDenoiser {
         if (nrdNormalRoughness != null) nrdNormalRoughness.destroy();
         if (viewZ != null) viewZ.destroy();
         if (denoised != null) denoised.destroy();
+        if (relaxResidual != null) relaxResidual.destroy();
         packer = null;
         resolver = null;
-        signal = nrdNormalRoughness = viewZ = denoised = null;
+        signal = nrdNormalRoughness = viewZ = denoised = relaxResidual = null;
         width = height = -1;
         firstFrame = true;
         lastMethod = -1;

@@ -66,7 +66,7 @@ Output: `build\libs\caustica-0.1.0.jar`.
 
 ## BMFR texture clarity fix
 
-- BMFR now traces and denoises at native display resolution instead of inheriting the shared 50% realtime OIDN/NRD resolution.
+- BMFR now honors the shared realtime-denoiser resolution and can run before NRD and realtime OIDN in the fixed denoiser chain.
 - Native-size fallback presentation uses an exact Vulkan image copy rather than a filtered blit.
 - BMFR restores bounded current-frame detail only where the albedo guide confirms real texture variation, keeping pixel-art textures and foliage crisp without a generic sharpening pass.
 - Temporal persistence was reduced slightly so moving texture detail does not soften into history.
